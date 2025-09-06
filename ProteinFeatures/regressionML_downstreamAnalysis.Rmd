@@ -1,0 +1,110 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+lapply(paste('package:',names(sessionInfo()$otherPkgs),sep=""),detach,character.only=TRUE,unload=TRUE)
+```
+
+```{r}
+library(caret)
+library(caretEnsemble)
+library(dplyr)
+library(gbm)
+library(Cubist)
+library(randomForest)
+```
+
+Load list of regression models
+```{r}
+modelList.regression <- readRDS("Output/modelList_regression_descriptive_microgram.RDS")
+corr <- readRDS("Output/corrList_µg.RDS") 
+corr.pass <- corr$pass %>% lapply(. %>% tibble::rownames_to_column(., var="feature.name"))
+corr.fail0 <- corr$fail0 %>% lapply(. %>% tibble::rownames_to_column(., var="feature.name"))
+```
+
+```{r}
+modelPerformance.descriptive <- function(i) {
+  model.list <- as.caretList(modelList.regression[[i]]$modelList)
+  train.data <- modelList.regression[[i]]$train.data
+  ## Plot resampled performance of model list
+  resResample <- resamples(model.list)
+  plot_rmse <- dotplot(resResample, metric="RMSE", main=names(modelList.regression)[i])
+  plot_r2 <- dotplot(resResample, metric="Rsquared", main=names(modelList.regression)[i])
+  ## performance of predictions using train data
+  #ex.pred <- extractPrediction(model.list, testX=subset(train.data, select=-c(response.var)), testY=train.data$response.var)
+  ex.pred <- extractPrediction(model.list)
+  # plot with Rsquared values calculated using linear regression (lm)
+  plot_modPerf <- xyplot(obs ~ pred | model, 
+       #data = ex.pred[ex.pred$dataType=="Training" ,], 
+       data = ex.pred,
+       panel = function(x, y, ...) {
+         panel.xyplot(x, y, ...)
+         lm1 <- lm(y ~ x)
+         lm1sum <- summary(lm1)
+         r2 <- lm1sum$adj.r.squared
+         panel.abline(a = lm1$coefficients[1], 
+                      b = lm1$coefficients[2])
+         panel.text(labels = bquote(italic(R)^2 == .(format(r2, digits = 3))),x = -1.8, y = 2.5)
+         },
+       as.table = TRUE, layout=c(4,2), main=names(modelList.regression)[i])
+  # table of performance metric calculated using caret
+  test.performance <- lapply(as.character(unique(ex.pred$model)), function(x) {
+    #postResample(pred=filter(ex.pred, dataType=="Test" & model==x)$pred, obs=filter(ex.pred, dataType=="Test" & model==x)$obs)
+    postResample(pred=filter(ex.pred, model==x)$pred, obs=filter(ex.pred, model==x)$obs)
+  }) %>% setNames(as.character(unique(ex.pred$model)))
+  test.performance <- as.data.frame(do.call(rbind,test.performance))
+  ## variable importance
+  var.importance <- lapply(model.list, varImp) #scale=FALSE
+  return(list("plot_RMSE"=plot_rmse, "plot_R2"=plot_r2, "plot_modPerf"=plot_modPerf, "performance.table"=test.performance, "varImp"=var.importance))
+}
+```
+
+```{r}
+modelPerformance.list <- lapply(1:2, modelPerformance.descriptive)%>% setNames(names(modelList.regression)[1:2])
+#saveRDS(modelPerformance.list, "Output/regression_performanceList.RDS")
+```
+
+variable importance
+```{r}
+var.importance <- function(model.performance){
+  varImp.list <- lapply(model.performance$varImp, function(x) {x$importance %>% tibble::rownames_to_column("feature") %>%
+      left_join(modelList.regression$featureName.map, by=c("feature"="feature.ID")) %>%
+      arrange(desc(Overall)) %>% 
+      left_join(corr.pass$cor.Spearman)})
+  varImp.list.top <- lapply(varImp.list, function(x){slice(x, 1:10)})
+  varImp.df <- bind_rows(varImp.list.top, .id = "column_label")
+  varImp.table <- table(varImp.df$feature.name) %>% as.data.frame() %>% arrange(desc(Freq)) %>% dplyr::rename("feature.name"="Var1") %>%
+    left_join(corr.pass$cor.Spearman)
+  final.varImp.list <- varImp.list
+  final.varImp.list[['feat.table']] <- varImp.table
+  final.varImp.list[['top.features']] <- varImp.df
+  return(final.varImp.list)
+}
+```
+
+```{r}
+var.imp.table <- lapply(modelPerformance.list, var.importance)
+#saveRDS(var.imp.table, "Output/varImportance_regression.RDS")
+openxlsx::write.xlsx(append(var.imp.table$rm.allNA, list(performance=modelPerformance.list$rm.allNA$performance.table %>% tibble::rownames_to_column("model"))),
+                     "Output/regression_varImp_rmNA.xlsx", overwrite =T)
+```
+
+Look at varImp of best model:random forest
+```{r}
+varImp.rmNA.rf <- var.imp.table$rm.allNA$randomForest %>% mutate(r_label=paste0("r=", sprintf("%.3f", round(r,3)))) %>% mutate(corr.dir = ifelse(r<0, "negative correlation", "positive correlation"))
+
+varImp.knnImp.rf <- var.imp.table$knnImp$randomForest %>% mutate(r_label=paste0("r=", sprintf("%.3f", round(r,3)))) %>% mutate(corr.dir = ifelse(r<0, "negative correlation", "positive correlation"))
+```
+
+Look at coefficients of glmnet model to get idea of directionality
+```{r}
+knn.glmnet <- coef(modelList.regression$knnImp$modelList$elasticNet$finalModel, modelList.regression$knnImp$modelList$elasticNet$bestTune$lambda)
+knn.pls <- coef(modelList.regression$knnImp$modelList$PLS$finalModel) %>% as.data.frame() %>% tibble::rownames_to_column("feature")
+rmNA.pls <- coef(modelList.regression$rm.allNA$modelList$PLS$finalModel) %>% as.data.frame() %>% tibble::rownames_to_column("feature")
+```
+
+```{r}
+openxlsx::write.xlsx(list(knnImp_rf=varImp.knnImp.rf, rmNA_rf=varImp.rmNA.rf, knn_pls=knn.pls, rmNA_pls=rmNA.pls), "HM_Output/MLmodels/regression_decriptive_results.xlsx", overwrite =T)
+```

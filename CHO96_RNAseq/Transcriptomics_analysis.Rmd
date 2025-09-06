@@ -1,0 +1,618 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+lapply(paste('package:',names(sessionInfo()$otherPkgs),sep=""),detach,character.only=TRUE,unload=TRUE)
+```
+
+```{r}
+library(data.table)
+library(dplyr)
+library(tidyverse)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(ReactomePA)
+library(DESeq2)
+library(factoextra)
+library(plyr)
+library(ggpmisc)
+library(survminer)
+library(SummarizedExperiment)
+```
+
+Load data
+```{r}
+txi.cho <- readRDS("Data/txi.cho.RDS") # gene-level summarization list from tximport
+CHO96 <- openxlsx::read.xlsx("Data/Secretome_samples_for_RNAseq_UPDATED_211210_vHM.xlsx", sheet="all_Updated_211210")
+transgene <- fread("Data/transgene.csv")
+```
+
+Save RNAseq TPM and count to excel file for supp material
+```{r}
+txi.cho.supMat <- txi.cho[c("abundance", "counts")]
+openxlsx::write.xlsx(txi.cho.supMat, "Output/SupplementaryMaterial/Supplementary Data 6.xlsx")
+```
+
+
+Add sample ID to CHO96 table and remove CCL28 sample which was replaced with WT for the RNAseq experiment
+```{r}
+setdiff(CHO96$Gene.name, transgene$genes)
+setdiff(transgene$genes, CHO96$Gene.name)
+CHO96 <- left_join(transgene[, c("sample_ID", "genes")], CHO96, by=c("genes"="Gene.name"))
+# add WT as group.info label for WT
+CHO96$group.info[96] <- "WT"
+```
+
+Plot transgene abundance vs protein abundance
+# remove WT and IL22 (IL22 has zero transgene count reads for some reason)
+```{r}
+rm.genes <- c("WT", "IL22")
+transgene.plot <- data.table(transgene)[transgene$genes %in% CHO96$genes ,][!transgene$genes %in% rm.genes,] %>%
+  left_join(CHO96[, c("genes", "Total.purified.protein_stock1.stock2_microg",  "amount_microgram", "conc", "viability")]) %>% mutate(pseudo_mg=1+Total.purified.protein_stock1.stock2_microg)
+
+Fig1b <- ggplot(transgene.plot, aes(x=transgene.tpm, y=pseudo_mg)) + 
+  geom_point(aes(color = amount_microgram), size=2) +
+  stat_poly_eq(aes(label = paste(..rr.label..)), formula = y~x, parse = TRUE, label.y = 1, size=6, label.x=0.025)+
+  stat_fit_glance(geom = "text",
+                    method = "lm",
+                    method.args = list(formula = y~x),
+                    aes(label = paste("P-value = ", signif(..p.value.., digits = 1), sep = "")),
+                    label.y= 3.6, size = 6, label.x= 2.07) +
+  geom_smooth(method = 'lm') +
+  xlab('transgene abundance (TPM)') + 
+  ylab('protein abundance +1 (µg)') + 
+  scale_x_log10() + scale_y_log10() + 
+  theme_classic2(base_size = 20)  %+replace%  theme(legend.title=element_blank(),
+                                      axis.title.x = element_text(size = 18, face = 'bold'),
+                                      axis.title.y = element_text(size = 18, face = 'bold', angle = 90),
+                                      legend.position = c(0.6, 0.2),
+                                      legend.direction="horizontal",
+                                      legend.background = element_rect(fill="lightgray", inherit.blank = T, color = 'white', size=1), legend.text=element_text(size=16))
+
+ggsave("Figures/Fig1b.svg", Fig1b, width = 8, height = 6)
+
+
+```
+
+Generate file for supplementary material
+```{r}
+supMat <- data.table(transgene)[transgene$genes %in% CHO96$genes , -c("protein_microgram", "protein_nmol")] %>%
+  left_join(CHO96[, c("genes", "Total.purified.protein_stock1.stock2_microg",  "amount_microgram")])
+openxlsx::write.xlsx(supMat, "Output/SupplementaryMaterial/Supplementary Data 1.xlsx")
+```
+
+
+Extract colors used in plot (to be reused througout rest of analyses)
+```{r}
+g <- ggplot_build(Fig1b)
+g$data[[1]]$colour %>% unique()
+```
+
+
+Statistical test:
+"Incidentally, cell lines that fail to secrete detectable levels of recombinant protein tend to express higher levels of transgene mRNAs compared to clones of higher yields"
+```{r}
+transgene.fail <- transgene.plot$transgene.tpm[transgene.plot$Total.purified.protein_stock1.stock2_microg == 0]
+transgene.pass <- transgene.plot$transgene.tpm[transgene.plot$Total.purified.protein_stock1.stock2_microg > 0]
+t.test(transgene.fail, transgene.pass, alternative="greater")
+```
+
+
+#####
+FILTER LOW COUNT BASED ON WHAT GTEX DOES
+https://www.researchgate.net/post/What-is-a-valid-way-to-measure-variability-of-gene-expression-from-gtex-data
+#####
+
+CV obviously depends very strongly on mean expression such that lowly expressed genes are going to tend to have much higher CV. Therefore, we cannot trust the CV of very lowly expressed genes, and so these should be filtered out of your analysis. If you want a well tested expression filtering scheme, you could use GTEx's scheme (Genes were selected based on expression thresholds of >0.1 TPM in at least 20% of samples and ≥6 reads in at least 20% of samples).
+```{r}
+identical(rownames(txi.cho$counts), rownames(txi.cho$abundance))
+nSamples <- ncol(txi.cho$abundance)
+keep <- sapply(1:nrow(txi.cho$abundance), function(i) {(sum(txi.cho$abundance[i,]>0.1) >= 0.2*nSamples) & (sum(txi.cho$counts[i,]>=6) >= 0.2*nSamples)})
+```
+
+There could also be a concern with the heteroscedasticity of the expression data. This is the phenomenon of variance depending strongly on mean expression. Now one may hope that this will be fully handled in the CV calculation since you are normalizing the variance to the mean expression, but that is only true if the association between variance and mean is linear. You can reduce heteroscedasticity concerns by either log2 or VST transforming your normalized expression values. For a more detailed discussion on this, check out this blog post: https://seqqc.wordpress.com/2015/02/16/should-you-transform-rna-seq-data-log-vst-voom/
+```{r}
+TPM.log <- log2(txi.cho$abundance[keep,] + 0.001) %>% as.data.frame() %>% tibble::rownames_to_column(var="gene") %>% data.table %>% mutate("sds"=matrixStats::rowSds(log2(txi.cho$abundance[keep,] + 0.001))) %>% dplyr::arrange(desc(sds))
+#count.vst <- DESeq2::vst(txi.cho$counts[keep,], fitType = "mean")
+```
+
+
+############################################################
+CHO-human map
+############################################################
+
+CHO-Human mapping
+```{r}
+map1 <- fread("ConversionTable/180405CHO_HUMAN_SYMBOL_ID_MAPPING_all.tsv")
+length(setdiff(TPM.log$gene, map1$choSymbol))
+length(setdiff(toupper(TPM.log$gene), toupper(map1$choSymbol)))
+
+CHO.human_map <- map1[map1$choSymbol %in% TPM.log$gene ,]
+apply(CHO.human_map, 2, function(x) {length(unique(x))})
+```
+
+```{r}
+saveRDS(list(TPM.log=TPM.log, pheno.data=CHO96, CHO.human_map=CHO.human_map), "Output/list.TPM_pheno_map.RDS")
+```
+
+############################################################
+Visualization of omics data (PCA, heatmap)
+############################################################
+
+PCA -- all samples
+```{r}
+
+res.pca <- t(TPM.log[, -c("gene", "sds")]) %>% `colnames<-`(TPM.log$gene) %>% as.data.frame() %>% prcomp()
+
+# visualize eigenvalues/variances
+eig.val <- fviz_screeplot(res.pca, addlabels=T, ylim = c(0, 20))
+
+### amount
+labs <- c(rep("", 91), CHO96$genes[92:96])
+point.col <- c(CHO96$amount_microgram[1:95], "WT")
+point.col[is.na(point.col)] <- "" %>% as.factor()
+fviz_pca_ind(res.pca,
+             label=labs,
+             geom.ind = c("text", "point"),
+             pointsize = 3,
+             mean.point = FALSE,
+             show.legend=FALSE,
+             habillage = point.col,
+             legend.title = "Cell Line",
+             repel = TRUE     # Avoid text overlapping
+) + theme(text=element_text(size=4), axis.text = element_text(size = 10), axis.title = element_text(size = 10), legend.text = element_text(size = 10), legend.title = element_text(size = 10), plot.title = element_text(size = 20)) + scale_color_manual(values=c("grey50", "#F8766D", "#00BA38","#619CFF" , "black"))
+
+plot.data <- fviz_pca_ind(res.pca, label="none")
+labs <- c(rep("", 91), CHO96$genes[92:96])
+point.col <- c(CHO96$amount_microgram[1:95], "WT")
+point.col[is.na(point.col)] <- "" %>% as.factor()
+ggplot(left_join(plot.data$data, CHO96, by=c("name"="genes")), aes(x=x, y=y, col=point.col,  label=labs)) + geom_point(size=3) +
+  scale_color_manual(values=c("grey50", "#F8766D", "#00BA38","#619CFF" , "black")) + 
+  theme_bw(base_size = 16) + geom_hline(yintercept = 0, linetype="dashed") + geom_vline(xintercept = 0, linetype="dashed") + 
+  theme(panel.border = element_blank()) + xlab(paste0("Dim1 (", round(eig.val$data$eig[1], 1), "%)")) +
+  ylab(paste0("Dim2 (", round(eig.val$data$eig[2], 2), "%)")) + theme(legend.title = element_blank()) +
+  geom_text(hjust=1.2,vjust=1.2, show.legend = FALSE) + theme(axis.title.x = element_text(face = 'bold'), axis.title.y = element_text(face = 'bold'))
+
+
+##### understand variable loadings
+PC1 <- res.pca$rotation[, "PC1"] #%>% setNames(TPM.log$gene)
+PC1 <- PC1[order(abs(PC1), decreasing = T)]
+PC2 <- res.pca$rotation[, "PC2"] #%>% setNames(TPM.log$gene)
+PC2 <- PC2[order(abs(PC2), decreasing = T)]
+
+PC1.map <- as.data.frame(PC1) %>% rownames_to_column(var="choSymbol") %>% left_join(map1) %>% dplyr::rename(PC.load=PC1) %>% data.table()
+PC2.map <- as.data.frame(PC2) %>% rownames_to_column(var="choSymbol") %>% left_join(map1) %>% dplyr::rename(PC.load=PC2) %>% data.table()
+```
+
+biplot (Figure 3a)
+```{r}
+point.col <- c(CHO96$amount_microgram[1:95], "WT")
+point.col[is.na(point.col)] <- "" %>% as.factor()
+top.var <- rbind(slice_min(PC1.map, order_by = PC.load, n=5), slice_max(PC1.map, order_by = PC.load, n=5))
+
+
+jpeg("Figures/Figure3a.jpg", width = 800, height = 500)
+## generate plot
+fviz_pca_biplot(res.pca,
+             label="var",
+             col.var = "grey",
+             geom.ind = c("point"),
+             labelsize=5,
+             pointsize = 3,
+             mean.point = FALSE,
+             show.legend=FALSE,
+             habillage = point.col,
+             legend.title = "Cell Line",
+             select.var = list(name = top.var$choSymbol),
+             repel = TRUE     # Avoid text overlapping
+) + theme(text=element_text(size=16), axis.text = element_text(size = 16), axis.title = element_text(size = 16), legend.text = element_text(size = 16), legend.title = element_text(size = 16), plot.title = element_text(size = 20)) + scale_color_manual(values=c("grey50", "#F8766D", "#00BA38","#619CFF" , "black")) +
+  scale_shape_manual(values=rep(19,5))
+dev.off()
+```
+
+GSEA on PC loadings
+```{r}
+PC.gsea <- function(PC.loadings) {
+  trim <- PC.loadings[!is.na(PC.loadings$humanSymbol) ,] %>% arrange(desc(PC.load))
+  gene.list <- trim$PC.load %>% setNames(trim$humanSymbol)
+  
+  set.seed(18)
+  gseaGO.BP <- gseGO(geneList = gene.list,
+                         ont="BP",
+                         keyType = "SYMBOL",
+                         OrgDb = org.Hs.eg.db,
+                         minGSSize = 8,
+                         pvalueCutoff = 0.05,
+                         pAdjustMethod = "BH") %>% clusterProfiler::simplify(cutoff = 0.7, by="p.adjust", select_fun=min)
+  set.seed(18)
+  gseaGO.MF <- gseGO(geneList = gene.list,
+                         ont="MF",
+                         keyType = "SYMBOL",
+                         OrgDb = org.Hs.eg.db,
+                         minGSSize = 8,
+                         pvalueCutoff = 0.05,
+                         pAdjustMethod = "BH") %>% clusterProfiler::simplify(cutoff = 0.7, by="p.adjust", select_fun=min)
+  set.seed(18)
+  gseaGO.CC <- gseGO(geneList = gene.list,
+                         ont="CC",
+                         keyType = "SYMBOL",
+                         OrgDb = org.Hs.eg.db,
+                         minGSSize = 8,
+                         pvalueCutoff = 0.05,
+                         pAdjustMethod = "BH") %>% clusterProfiler::simplify(cutoff = 0.7, by="p.adjust", select_fun=min)
+  set.seed(18)
+  gseaReactome <- gsePathway(geneList = gene.list %>% setNames(trim$humanID),
+                             organism = 'human',
+                             minGSSize = 10,
+                             pvalueCutoff = 0.05,
+                             pAdjustMethod = "BH")
+ # set.seed(18)
+  #gseaKEGG <- gseKEGG(geneList = gene.list %>% setNames(trim$humanID),
+                    # organism = 'hsa',
+                     #keyType= "ncbi-geneid",
+                 # minGSSize = 10,
+                 # pvalueCutoff = 0.05,
+                 # pAdjustMethod = "BH")
+  gseaRes.df <- list(GO.BP=data.table(gseaGO.BP@result)[p.adjust <= 0.01 ,], GO.MF=data.table(gseaGO.MF@result)[p.adjust <= 0.01 ,],
+    GO.CC=data.table(gseaGO.CC@result)[p.adjust <= 0.01 ,],
+    #KEGG=data.table(gseaKEGG@result)[p.adjust <= 0.01 ,],
+    Reactome=data.table(gseaReactome@result)[p.adjust <= 0.01 ,]) %>% rbindlist(idcol=T, fill=T)
+  
+  return(gseaRes.df)
+  
+}
+```
+
+```{r}
+set.seed(18)
+gseaPC1 <- PC.gsea(PC1.map)
+openxlsx::write.xlsx(list(PC1=PC1.map,PC1gsea=gseaPC1), "Output/PCA.xlsx")
+```
+
+############################################################
+GSEA between phenotypic groups
+############################################################
+
+group.info2== producers vs non-producers (including WT)
+group.info3== producers vs non-producers vs WT-pheno (WT and FLT3LG)
+group.info4== producers vs non-producers (excluding WT)
+
+```{r}
+col.data <- openxlsx::read.xlsx("Data/colData.xlsx")
+col.data[is.na(col.data)] <- ""
+txi.trim <- lapply(txi.cho[1:3], function(x) {x[rownames(x) %in% TPM.log$gene ,]})
+txi.trim[["countsFromAbundance"]] <- txi.cho$countsFromAbundance
+```
+
+Differential expression amount (lowest vs highest)
+```{r}
+identical(colnames(txi.trim$abundance), col.data$sample_ID)
+dds <- DESeqDataSetFromTximport(txi.trim, colData = col.data, design= ~amount_microgram)
+
+nrow(dds)
+keep <- rowSums(counts(dds)) > 1
+dds <- dds[keep,]
+nrow(dds)
+
+set.seed(18)
+dds <- DESeq(dds)
+
+res.amount <- DESeq2::results(dds, contrast=c("amount_microgram", "lowest amount", "highest amount")) %>% as.data.frame() %>% rownames_to_column(var="gene")
+
+```
+
+Differential expression: group.info2== non-producers (including WT) vs producers
+```{r}
+dds.prod <- DESeqDataSetFromTximport(txi.trim, colData = col.data, design= ~ group.info2)
+
+nrow(dds.prod)
+keep <- rowSums(counts(dds.prod)) > 1
+dds.prod <- dds.prod[keep,]
+nrow(dds.prod)
+
+set.seed(18)
+dds.prod <- DESeq(dds.prod)
+
+res.nonProd <- DESeq2::results(dds.prod, contrast=c("group.info2", "non-producer", "producer")) %>% as.data.frame() %>% rownames_to_column(var="gene")
+```
+
+Differential expression: group.info4== producers vs non-producers (excluding WT)
+```{r}
+dds.group4 <- DESeqDataSetFromTximport(txi.trim, colData = col.data, design= ~ group.info4)
+
+nrow(dds.group4)
+keep <- rowSums(counts(dds.group4)) > 1
+dds.group4 <- dds.group4[keep,]
+nrow(dds.group4)
+
+set.seed(18)
+dds.group4 <- DESeq(dds.group4)
+
+res.nonProd_exWT <- DESeq2::results(dds.group4, contrast=c("group.info4", "non-producer", "producer")) %>% as.data.frame() %>% rownames_to_column(var="gene")
+```
+
+Differential expression: group.info3 non-producers WT pheno (WT-pheno) vs producer
+```{r}
+identical(colnames(txi.trim$abundance), col.data$sample_ID)
+dds <- DESeqDataSetFromTximport(txi.trim, colData = col.data, design= ~group.info3)
+
+nrow(dds)
+keep <- rowSums(counts(dds)) > 1
+dds <- dds[keep,]
+nrow(dds)
+
+set.seed(18)
+dds <- DESeq(dds)
+
+res.np_WT <- DESeq2::results(dds, contrast=c("group.info3", "WT-pheno", "producer")) %>% as.data.frame() %>% rownames_to_column(var="gene")
+
+```
+
+Differential expression: group.info3 non-producers WT pheno (non-producer) vs producers
+```{r}
+identical(colnames(txi.trim$abundance), col.data$sample_ID)
+dds <- DESeqDataSetFromTximport(txi.trim, colData = col.data, design= ~group.info3)
+
+nrow(dds)
+keep <- rowSums(counts(dds)) > 1
+dds <- dds[keep,]
+nrow(dds)
+
+set.seed(18)
+dds <- DESeq(dds)
+
+res.np <- DESeq2::results(dds, contrast=c("group.info3", "non-producer", "producer")) %>% as.data.frame() %>% rownames_to_column(var="gene")
+
+```
+
+```{r}
+saveRDS(list(low_vs_high=res.amount, non_vs_prod_exWT=res.nonProd_exWT, non_vs_prod_incWT=res.nonProd, npWT_vs_prod=res.np_WT, np_vs_prod=res.np), "Output/DEanalysis/031822_DESeq2.RDS")
+```
+
+Set significance threshold
+```{r}
+res.amount.sig <- res.amount %>% subset(padj<=0.05 & abs(log2FoldChange)>= log2(1.5)) %>% arrange(desc(abs(log2FoldChange))) %>% 
+  left_join(CHO.human_map, by=c("gene"="choSymbol"))
+res.nonProd.sig <- res.nonProd %>% subset(padj<=0.05 & abs(log2FoldChange)>= log2(1.5)) %>% arrange(desc(abs(log2FoldChange))) %>% 
+  left_join(CHO.human_map, by=c("gene"="choSymbol"))
+res.nonProd_exWT.sig <- res.nonProd_exWT %>% subset(padj<=0.05 & abs(log2FoldChange)>= log2(1.5)) %>% arrange(desc(abs(log2FoldChange))) %>% 
+  left_join(CHO.human_map, by=c("gene"="choSymbol"))
+```
+
+GSEA function
+```{r}
+DESeq.gsea <- function(dds.res, thresh) {
+  dds.map <- left_join(dds.res, CHO.human_map, by=c("gene"="choSymbol")) %>% drop_na(humanID) %>% arrange(desc(log2FoldChange))
+  gene.list <- dds.map$log2FoldChange %>% setNames(dds.map$humanSymbol) #%>% arrange(Log2FoldChange)
+  
+  set.seed(18)
+  gseaGO.BP <- gseGO(geneList = gene.list,
+                         ont="BP",
+                         keyType = "SYMBOL",
+                         OrgDb = org.Hs.eg.db,
+                         minGSSize = 8,
+                         pvalueCutoff = 0.05,
+                         pAdjustMethod = "BH") %>% clusterProfiler::simplify(cutoff = thresh, by="p.adjust", select_fun=min)
+  set.seed(18)
+  gseaGO.MF <- gseGO(geneList = gene.list,
+                         ont="MF",
+                         keyType = "SYMBOL",
+                         OrgDb = org.Hs.eg.db,
+                         minGSSize = 8,
+                         pvalueCutoff = 0.05,
+                         pAdjustMethod = "BH") %>% clusterProfiler::simplify(cutoff = thresh, by="p.adjust", select_fun=min)
+  set.seed(18)
+  gseaGO.CC <- gseGO(geneList = gene.list,
+                         ont="CC",
+                         keyType = "SYMBOL",
+                         OrgDb = org.Hs.eg.db,
+                         minGSSize = 8,
+                         pvalueCutoff = 0.05,
+                         pAdjustMethod = "BH") %>% clusterProfiler::simplify(cutoff = thresh, by="p.adjust", select_fun=min)
+  set.seed(18)
+  gseaReactome <- gsePathway(geneList = gene.list %>% setNames(dds.map$humanID),
+                             organism = 'human',
+                             minGSSize = 10,
+                             pvalueCutoff = 0.05,
+                             pAdjustMethod = "BH")
+  set.seed(18)
+  gseaKEGG <- gseKEGG(geneList = gene.list %>% setNames(dds.map$humanID),
+                      organism = 'hsa',
+                      minGSSize = 10,
+                      pvalueCutoff = 0.05,
+                      pAdjustMethod = "BH")
+  
+  gseaRes.df <- list(GO.BP=data.table(gseaGO.BP@result)[p.adjust <= 0.01 ,],
+                     GO.MF=data.table(gseaGO.MF@result)[p.adjust <= 0.01 ,],
+                     GO.CC=data.table(gseaGO.CC@result)[p.adjust <= 0.01 ,],
+                     KEGG=data.table(gseaKEGG@result)[p.adjust <= 0.01 ,],
+                     Reactome=data.table(gseaReactome@result)[p.adjust <= 0.01 ,]) %>% rbindlist(idcol=T, fill=T)
+  
+  return(gseaRes.df)
+  
+}
+```
+
+
+```{r}
+sim.thresh=0.7
+gsea.amount <- DESeq.gsea(res.amount, sim.thresh)
+gsea.nonProd <- DESeq.gsea(res.nonProd, sim.thresh)
+gsea.nonProd_exWT <- DESeq.gsea(res.nonProd_exWT, sim.thresh)
+gsea.np_WT <- DESeq.gsea(res.np_WT, sim.thresh)
+gsea.np <- DESeq.gsea(res.np, sim.thresh)
+```
+
+common between non and low producers
+```{r}
+intersect(gsea.amount$ID, gsea.nonProd_exWT$ID) %>% length()
+intersect(gsea.amount$ID[gsea.amount$NES >0], gsea.nonProd_exWT$ID[gsea.nonProd_exWT$NES>0]) %>% length()
+intersect(gsea.amount$ID[gsea.amount$NES <0], gsea.nonProd_exWT$ID[gsea.nonProd_exWT$NES<0]) %>% length()
+
+gsea.common <- inner_join(gsea.amount %>% setNames(paste0(names(gsea.amount), "_amount")),
+                          gsea.nonProd_exWT %>% setNames(paste0(names(gsea.nonProd_exWT), "_nonProd")),
+                          by=c("ID_amount"="ID_nonProd"))
+```
+
+unique among non and low producers
+```{r}
+setdiff(gsea.nonProd_exWT$ID, gsea.amount$ID) %>% length()
+setdiff(gsea.amount$ID, gsea.nonProd_exWT$ID) %>% length()
+
+gsea.unique_nonProd <- gsea.nonProd_exWT[!gsea.nonProd_exWT$ID %in% gsea.amount$ID ,]
+gsea.unique_amount <- gsea.amount[!gsea.amount$ID %in% gsea.nonProd_exWT$ID ,]
+```
+
+
+```{r}
+gsea.list <- list(amount=gsea.amount, 
+                  nonProd_exWT=gsea.nonProd_exWT, 
+                  nonProd=gsea.nonProd,
+                  common=gsea.common, 
+                  unique_nonProd_exWT=gsea.unique_nonProd, 
+                  unique_amount=gsea.unique_amount, 
+                  np_WT=gsea.np_WT, 
+                  np=gsea.np)
+openxlsx::write.xlsx(gsea.list, "Output/GSEA/GSEAresults.xlsx")
+```
+
+plot interesting results
+```{r}
+subset.interesting <- openxlsx::read.xlsx("Output/GSEA/GSEA_Table_23.xlsx", sheet="nonProd_subset")
+subset.interesting<- subset.interesting[order(nrow(subset.interesting):1) ,]
+subset.interesting$Description <- factor(subset.interesting$Description, levels=subset.interesting$Description)
+
+lab.col <- RColorBrewer::brewer.pal(length(unique(subset.interesting$Category)), "Set2")[network::as.color(subset.interesting$Category)] %>% colorspace::darken(0.2)
+## barplot
+gsea.plot <- ggplot(subset.interesting, # you can replace the numbers to the row number of pathway of your interest
+       aes(x = NES, y = Description)) +
+  geom_col(aes(fill = p.adjust)) +
+  theme_bw(base_size = 20) +
+  scale_fill_gradient(limits=c(0, 0.01), low="red", high="blue") +
+  ylab(NULL) +
+  labs(title="GSEA", subtitle="failed vs. successful producers") +
+  theme(axis.text.y = element_text(colour = lab.col)) +
+  theme(legend.justification = "top")
+ggsave("Figures/Fig3b.png", gsea.plot, width = 11.2, height = 7)
+
+## dummy plot to get color legend
+df <- data.frame(val=rep(6:1), cat=unique(subset.interesting$Category), color=unique(lab.col), dummy=rep("",6)) %>%
+  mutate(Category = glue::glue("<span style='color:{color}'>{cat}</span> {dummy}"),
+  Category = fct_reorder(Category, val))
+
+gsea.legend <- ggplot(df, aes(x= Category, y= val, fill=Category)) +
+  geom_bar(stat="identity") + 
+  scale_fill_manual(values=rev(unique(lab.col))) + theme(axis.text.x = ggtext::element_markdown(), legend.text = ggtext::element_markdown(size=20), legend.key.size=unit(0.5, "cm"), legend.key.width = unit(0.25,"cm"), legend.title = element_text(size=20))
+ggsave("Figures/Figure3b_legend.png", gsea.legend, width = 11, height = 7.5)
+
+```
+
+
+############################################################
+Var explained from omics data
+############################################################
+Avoid curse of dimensionality by using dimensionality reduction (e.g PCA)
+```{r}
+response.var <- CHO96[, c("sample_ID", "Total.purified.protein_stock1.stock2_microg")]
+identical(rownames(res.pca$x), response.var$sample_ID)
+fit.df <- res.pca$x[, 1:3] %>% as.data.frame() %>%
+  mutate(response.var=log10(response.var$Total.purified.protein_stock1.stock2_microg + 0.001)) %>%
+  dplyr::slice(1:95) #remove WT
+
+# var explained by x principal components
+eig.val$data$eig[1:3] %>% sum()
+
+# remove highly correlated features (aka genes)
+pc.cor <- cor(fit.df)
+summary(pc.cor[upper.tri(pc.cor)])
+corrplot::corrplot(pc.cor, method="circle", addCoef.col = 1, tl.cex = 1.2)
+#highly.cor <- caret::findCorrelation(stress.cor, cutoff = .75)
+#fit.filtered <- fit.df[,-highly.cor]
+
+
+fit <- stats::lm(response.var ~ ., data=fit.df)
+fit2 <- stats::lm(response.var ~ ., data=fit.df[c("PC1", "PC3", "response.var")])
+summary(fit)
+summary(fit2)
+#car::avPlots(fit, marginal.scale=F, id=F)
+```
+
+```{r}
+layout(matrix(c(1,2,3,4),2,2,byrow=T))
+plot(fit$fitted.values, rstudent(fit),
+ main="Multi Fit Studentized Residuals",
+ xlab="Predictions",ylab="Studentized Resid",
+ ylim=c(-2.5,2.5))
+abline(h=0, lty=2)
+plot(fit.df$PC1, fit$resid,
+ main="Residuals by PC1",
+ xlab="PC1",ylab="Residuals")
+abline(h=0,lty=2)
+hist(fit$resid, main="Histogram of Residuals")
+qqnorm(fit$resid)
+qqline(fit$resid)
+```
+
+
+```{r}
+plot(fit)
+```
+
+Sequentially add additional PCs and calcualte var explained (analogous to protein features)
+```{r}
+varExplained <- function(PC, response.df, y) {
+  list.var.exp <- list()
+  for (i in 1:(ncol(PC))) {
+    var.data <- cbind(dplyr::select(PC, c(1:i)), dplyr::select(response.df, c("response.var")))
+    fit <- stats::lm(response.var ~ ., data=var.data ) %>% summary()
+    list.var.exp[[i]] <- data.table(num.var=i, var.exp=fit$adj.r.squared)
+  }
+  return(list.var.exp)
+}
+```
+
+```{r}
+y.nmol <- CHO96[-96, c("sample_ID", "Total.purified.protein_stock1..stock2_nmol")] %>%
+  mutate(response.var=log10(Total.purified.protein_stock1..stock2_nmol + 0.001))
+y.mg <- CHO96[-96, c("sample_ID", "Total.purified.protein_stock1.stock2_microg")] %>%
+  mutate(response.var=log10(Total.purified.protein_stock1.stock2_microg + 0.001))
+PC.var <- as.data.frame(res.pca$x[-96,-96])
+identical(y.nmol$sample_ID, rownames(PC.var))
+identical(y.mg$sample_ID, rownames(PC.var))
+df.var.exp <- varExplained(PC=PC.var, response.df = y.mg) %>% bind_rows()
+```
+
+```{r}
+df.var.exp <- na.omit(df.var.exp)
+df.var.exp$percent.exp <- scales::label_percent(accuracy = 0.01)(df.var.exp$var.exp)
+
+#png("Figures/transcriptome_varExp.png", width=500, height=350)
+ggplot(df.var.exp, aes(num.var, var.exp)) +   # Draw ggplot2 scatterplot with smooth curve
+  geom_point() +
+  theme(text=element_text(size=18)) +
+  #geom_smooth(se = FALSE, method = "loess", formula = y ~ x) +
+  gghighlight::gghighlight(var.exp == max(df.var.exp$var.exp),
+              unhighlighted_params = list(colour = NULL, alpha = 0.3)) +
+  xlab("# variables incuded in fit") + ylab("variability explained") +
+  geom_label(data=subset(df.var.exp, var.exp==max(df.var.exp$var.exp))[1,],
+             aes(num.var, var.exp, label=percent.exp),
+               hjust = 0.5, vjust = -0.5, fill = "red", colour = "white", alpha= 0.5) + ylim(0, 0.89)
+#dev.off()
+```
+
+
+Density plot of high vs low producers
+```{r}
+plot.data <- data.table(CHO96[1:91 ,]) %>% mutate(log.yield=log10(Total.purified.protein_stock1.stock2_microg))
+# high = "#F8766D"
+# low = "#00BA38"
+
+ggplot(plot.data, aes(x=log.yield, fill=as.factor(amount_microgram))) + geom_density(alpha=0.4) + 
+  labs(fill = "Protein yield") + xlab("log10 abundance (μg)") + theme_bw() + theme(text=element_text(size=15)) + 
+  scale_fill_manual( values = c("#F8766D","#00BA38"))
+```
+
+

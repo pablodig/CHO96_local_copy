@@ -1,0 +1,321 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+lapply(paste('package:',names(sessionInfo()$otherPkgs),sep=""),detach,character.only=TRUE,unload=TRUE)
+```
+
+```{r}
+library(data.table)
+library(tidyverse)
+library(Hmisc)
+library(ggplot2)
+```
+
+Load data
+```{r}
+features.merged.transformed.m <- readRDS("Data/Tegel2020_allFeatures.merged.m.RDS")
+proteins.dt <- fread('Data/Tegel.proteins.dt.csv')
+```
+
+Convert long to wide on transformed data
+```{r}
+selected.predictors <- unique(features.merged.transformed.m$feature.name) #use ALL predictor variables
+features.merged.transformed.w <- dcast(features.merged.transformed.m[feature.name%in%selected.predictors,], Cultivation+sample_ID+nrow+human_symbol+uniprot_id~feature.type+feature.name+variable, value.var = 'value')
+```
+
+Generate table of features
+```{r}
+openxlsx::write.xlsx(features.merged.transformed.m[, c("feature.type", "feature.name", "variable")] %>% distinct(),"Output/featureTable.xlsx")
+```
+
+Match row order
+```{r}
+identical(features.merged.transformed.w$Cultivation, proteins.dt$Cultivation)
+idx <- match(features.merged.transformed.w$Cultivation, proteins.dt$Cultivation)
+proteins.dt <- proteins.dt[idx,]
+identical(features.merged.transformed.w$Cultivation, proteins.dt$Cultivation)
+```
+
+Subset data into meaningful groups to be used as input in the correlation analysis
+```{r}
+##### Only look at clones that are associated with non-NA production
+proteins.dt_pass <- proteins.dt[!(Cultivation %in% 
+                                    proteins.dt$Cultivation[is.na(proteins.dt$Protein.amount..µg.)]),]
+features.merged.transformed.w_pass <- features.merged.transformed.w[match(proteins.dt_pass$Cultivation, features.merged.transformed.w$Cultivation) ,]
+identical(proteins.dt_pass$Cultivation, features.merged.transformed.w_pass$Cultivation)
+
+##### Remove clones with missing titer information that is NOT due to failing, and set those that did fail to have 0 production
+# 1) Remove clones with 'ongoing' status and missing titer information
+# 2) Remove clones with 'pass' status and missing titer information
+# 3) Force all failed clones (missing titer information) to have a titer of 0
+proteins.dt_fail0 <- proteins.dt[!(Cultivation %in% 
+                                     proteins.dt[Status=="Ongoing" | (Status=="Pass" & is.na(Protein.amount..µg.)), Cultivation]),]
+proteins.dt_fail0[grepl("Fail", proteins.dt_fail0$Status), Protein.amount..µg. := 0]
+features.merged.transformed.w_fail0 <- features.merged.transformed.w[match(proteins.dt_fail0$Cultivation, features.merged.transformed.w$Cultivation) ,]
+identical(proteins.dt_fail0$Cultivation, features.merged.transformed.w_fail0$Cultivation)
+
+## save cleaned up version of Tegel data
+openxlsx::write.xlsx(proteins.dt_fail0, "Output/SuppData10.xlsx")
+```
+
+###########################################
+PLOT CUMMULATIVE DENSITY (Figure 1a)
+###########################################
+
+```{r}
+# Add column (titers in mg)
+tegel <-proteins.dt_fail0 %>% mutate(amount_mg=Protein.amount..µg./1000)
+
+png("Figures/Fig1a.png", width = 700, height = 500)
+ggplot(tegel, aes(amount_mg)) +
+  stat_ecdf(geom = "step", colour="#3366FF", size=1.5)  +
+  ylab("% human proteins expressed") + xlab("protein produced (mg)") + 
+  scale_y_continuous(limits=c(0,1), labels=c('0%', '25%', '50%', '75%', '100%')) +
+  theme_classic(base_size = 20) %+replace% theme(axis.title.x = element_text(size = 18, face = 'bold'),
+                                                 axis.title.y = element_text(size = 18, face = 'bold', angle = 90))
+dev.off()
+```
+
+Percentage of proteins unable to be produced in CHO
+```{r}
+sum(tegel$amount_mg==0)/nrow(tegel) * 100
+```
+
+###########################################
+CORRELATION ANALYSIS
+###########################################
+
+Correlation function
+```{r}
+corrAnalysis <- function(response.var, var_features) {
+  
+  # Clean up features matrix to use as input to correlation function
+  #response.var <- var_proteins.dt$Protein.amount..µg.
+  features.matrix <- var_features[, 6:ncol(var_features)]
+  
+  # Spearman correlation
+  cor_spearman <- rcorr(as.matrix(cbind(response.var, features.matrix)), type="spearman")
+  corS <- data.frame(r=cor_spearman$r[,"response.var"], padj=p.adjust(cor_spearman$P[,"response.var"], method="BH"))
+  corS_sort <- corS[order(abs(corS$r), decreasing = TRUE),]
+  
+  # Partial correlation controlling for MW
+  # using cor.test b/c other packages that calculate partial correlation and handle missing values (psych) do not return corresponding pvalues
+  varsMatrix <- features.matrix[, !"sequence_Mol.Weight_MW..Da."]
+  pCor <- data.table(predictor.var=character(), r=numeric(), padj=numeric())
+  counter=0
+  for (var in names(varsMatrix)) {
+    counter=counter+1
+    tryCatch({
+      xres <- residuals(lm(varsMatrix[[var]] ~ features.matrix$sequence_Mol.Weight_MW..Da., na.action = na.exclude))
+      yres <- residuals(lm(response.var ~ features.matrix$sequence_Mol.Weight_MW..Da., na.action = na.exclude))
+      ct <- cor.test(xres, yres, method="spearman")
+      pCor <- rbind(pCor, data.table(predictor.var=var, r=ct$estimate, padj=ct$p.value))
+    }, error=function(e){paste('was not able to calculate correlation with', var, sep=" ")})
+  }
+  pCor_sort <- pCor[order(abs(pCor$r), decreasing=T)]
+  
+  # return correlations in list object (both have been sorted strongest to weakest correlation)
+  return(list(cor.Spearman = corS_sort, pCor.Spearman = pCor_sort))
+}
+```
+
+Correlation using µg
+```{r}
+corList_pass.µg <- corrAnalysis(proteins.dt_pass$Protein.amount..µg., features.merged.transformed.w_pass, response.var = )
+corList_fail0.µg <- corrAnalysis(proteins.dt_fail0$Protein.amount..µg., features.merged.transformed.w_fail0)
+saveRDS(list(pass=corList_pass.µg, fail0=corList_fail0.µg), "Output/corrList_µg.RDS")
+openxlsx::write.xlsx(list(pass=corList_pass.µg$cor.Spearman, fail0=corList_fail0.µg$cor.Spearman), "Output/corrList_µg.xlsx", rowNames=T)
+```
+
+Correlation using nmol
+```{r}
+corList_pass.nmol <- corrAnalysis(proteins.dt_pass$Protein.amount..µg./(features.merged.transformed.w_pass$sequence_Mol.Weight_MW..Da./1000), features.merged.transformed.w_pass)
+corList_fail0.nmol <- corrAnalysis(proteins.dt_fail0$Protein.amount..µg./(features.merged.transformed.w_fail0$sequence_Mol.Weight_MW..Da./1000), features.merged.transformed.w_fail0)
+saveRDS(list(pass=corList_pass.nmol, fail0=corList_fail0.nmol), "Output/corrList_nmol.RDS")
+openxlsx::write.xlsx(list(pass=corList_pass.nmol$cor.Spearman, fail0=corList_fail0.nmol$cor.Spearman), "Output/corrList_nmol.xlsx", rowNames=T)
+```
+
+
+***** Note that SP is essentially a binary variables
+Manually calculate the point-biserial correlation (used for correlate binary variable to continuous variable)
+Note: Assumptions
+1) Y is almost normally distributed.
+2) The regression Y on X is linear
+3) The mean value of Y in the minor or smaller category as specified by X lies on the regression lines.
+
+```{r}
+corr.SP <- function(response.var, var_features) {
+  # Isolate vars of interest
+  #response.var <- var_proteins.dt$Protein.amount..µg.
+  SP.var <- var_features$sequence_PSIM_SP
+  
+  # transform response variable so that it meets assumption 1 (almost normal)
+  response.var <- log10(response.var + 0.001)
+  
+  # transform SP var back to binary
+  SP.var.binary <- SP.var
+  SP.var.binary[SP.var>0] <- 1
+  
+  # point biserial correlation
+  res.cor <- stats::cor.test(SP.var.binary, response.var)
+  
+  return(res.cor)
+}
+
+```
+
+Correlation of nmole with SP
+```{r}
+corr.SP(proteins.dt_pass$Protein.amount..µg./(features.merged.transformed.w_pass$sequence_Mol.Weight_MW..Da./1000), features.merged.transformed.w_pass)
+#corr.SP(proteins.dt_fail0, features.merged.transformed.w_fail0)
+```
+
+ttest to see if titers between groups is sig different
+```{r}
+ttest.SP <- function(response.var, SP) {
+  nmol.SP <- response.var[which(SP>0)]
+  nmol.noSP <- response.var[which(SP==0)]
+  
+  boxplot(nmol.SP, nmol.noSP)
+  res.test <- t.test(nmol.SP, nmol.noSP)
+  return(res.test)
+}
+```
+
+```{r}
+ttest.SP(proteins.dt_pass$Protein.amount..µg./(features.merged.transformed.w_pass$sequence_Mol.Weight_MW..Da./1000),
+         features.merged.transformed.w_pass$sequence_PSIM_SP)
+
+ttest.SP(proteins.dt_fail0$Protein.amount..µg./(features.merged.transformed.w_fail0$sequence_Mol.Weight_MW..Da./1000),
+         features.merged.transformed.w_fail0$sequence_PSIM_SP)
+```
+
+ttest to see if Nglycan different between pass/fail groups
+```{r}
+#sequence_iPTMnet_N.Glycosylation
+#sequence_PTM.detailed_Glycosylation__N
+tmp <- left_join(features.merged.transformed.w_fail0, dplyr::select(proteins.dt_fail0, c("Cultivation", "Status")))
+t.test(dplyr::filter(tmp, Status=="Pass") %>% dplyr::select("sequence_iPTMnet_N.Glycosylation"),
+                        dplyr::filter(tmp, Status!="Pass") %>% dplyr::select("sequence_iPTMnet_N.Glycosylation"))
+
+t.test(dplyr::filter(tmp, Status=="Pass") %>% dplyr::select("sequence_PTM.detailed_Glycosylation__N"),
+                        dplyr::filter(tmp, Status!="Pass") %>% dplyr::select("sequence_PTM.detailed_Glycosylation__N"))
+
+rm(tmp)
+```
+
+
+correaltion between top variables in table
+```{r}
+top.cor <- dplyr::select(features.merged.transformed.w_pass, c("sequence_Mol.Weight_MW..Da.", "sequence_PSIM_SP", "abundance_Matt_translatie.rate.avg", "abundance_Matt_P.copy.number.avg", "sequence_SS_ss_helix", "sequence_proStab_Tm.agg", "sequence_solubility_percent-sol")) %>%
+                   `colnames<-`(c("MW (Da)", "Signal Peptide", "Translation rate", "Protein copy number", "Alpha helix", "Stability index", "Percent solubility")) %>%
+  as.matrix()
+res.cor <- rcorr(top.cor, type="spearman")
+
+corrplot::corrplot(res.cor$r, type="upper", order="hclust", tl.col="black", tl.srt=45, addCoef.col = 'black')
+
+```
+
+
+```{r}
+saveRDS(list("features_allSamples"=features.merged.transformed.w, "features_passSamples"=features.merged.transformed.w_pass, "proteins.dt_pass"= proteins.dt_pass,
+             "features_fail0"=features.merged.transformed.w_fail0, "proteins.dt_fail0"=proteins.dt_fail0), "Output/Tegel2020_allFeatures.RDS")
+```
+
+
+
+
+
+
+************************************
+Investigate positive correlation with MW (odd)... try bining data and then re-doing correlations
+************************************
+
+```{r}
+corList_pass$cor.Spearman[grep("weight", rownames(corList_pass$cor.Spearman), ignore.case = T) ,]
+corList_fail0$cor.Spearman[grep("weight", rownames(corList_fail0$cor.Spearman), ignore.case = T) ,]
+```
+
+
+```{r}
+#bin samples according to MW
+#MW.bin <- OneR::bin(log10(features.merged.transformed.w_pass$sequence_Mol.Weight_MW..Da.), nbins=4, method="length", labels=c("low", 'medium-low', 'medium-high', "high"))
+MW.bin <- OneR::bin(log10(features.merged.transformed.w_pass$sequence_Mol.Weight_MW..Da.), nbins=4, method="content")
+
+MW.corTable.log <- data.table(MW=log10(features.merged.transformed.w_pass$sequence_Mol.Weight_MW..Da.), abundance=log10(proteins.dt_pass$Protein.amount..µg.), MW_bin=MW.bin)
+MW.corTable <- data.table(MW=features.merged.transformed.w_pass$sequence_Mol.Weight_MW..Da., abundance=proteins.dt_pass$Protein.amount..µg., MW_bin=MW.bin)
+```
+
+```{r}
+xyplot(MW ~ abundance | MW_bin, 
+       data = MW.corTable.log,
+       panel = function(x, y, ...) {
+         panel.xyplot(x, y, ...)
+         panel.lmline(x, y, ...)
+         res.cor <- cor.test(x,y, method="spearman")
+         panel.text(labels = bquote(italic(r) == .(format(res.cor$estimate, digits = 3))),x = 2.5, y = 5.7) #content: x = 2.5, y = 5.7
+         panel.text(labels = bquote(p == .(format(res.cor$p.value, digits = 2))),x = 2.5, y = 5.6) #content: x = 2.5, y = 5.6
+       },
+       as.table = TRUE, layout=c(4,1),
+       xlab="log10 abundance (µg)",
+       ylab="log10 MW (Da)")
+
+xyplot(MW ~ abundance | MW_bin, 
+       data = MW.corTable,
+       scales=list(x=list(log=10),
+                   y=list(log=10)),
+       panel = function(x, y, ...) {
+         panel.xyplot(x, y, ...)
+         panel.lmline(x, y, ...)
+         res.cor <- cor.test(x,y, method="spearman")
+         panel.text(labels = bquote(italic(r) == .(format(res.cor$estimate, digits = 3))),x = 2.5, y = 5.7)
+         panel.text(labels = bquote(p == .(format(res.cor$p.value, digits = 2))),x = 2.5, y = 5.6)
+       },
+       as.table = TRUE, layout=c(4,1),
+       xlab="abundance (µg)",
+       ylab="MW (Da)")
+```
+
+Find MW threshold (inflection point)
+```{r}
+#quantile(features.merged.transformed.w_pass$sequence_Mol.Weight_MW..Da., probs=seq(0.01,0.09, 0.01))
+MW.df <- data.table(MW=features.merged.transformed.w_pass$sequence_Mol.Weight_MW..Da., abundance=proteins.dt_pass$Protein.amount..µg.)
+
+MW.threshold <- function(v.thresh, data) {
+  cor.less.list <- list()
+  cor.greater.list <- list()
+  for (thresh in v.thresh) {
+    data.less <- data[MW<thresh,]
+    data.greater <- data[MW>thresh,]
+    
+    cor.less <- cor.test(data.less$MW, data.less$abundance, method="spearman")
+    cor.greater <- cor.test(data.greater$MW, data.greater$abundance, method="spearman")
+    
+    cor.less.list[[as.character(thresh)]] <- data.table(cor=cor.less$estimate, pval=cor.less$p.value)
+    cor.greater.list[[as.character(thresh)]] <- data.table(cor=cor.greater$estimate, pval=cor.greater$p.value)
+  }
+  MW.cor.less <- dplyr::bind_rows(cor.less.list, .id="threshold") %>% mutate(group="less") %>% filter(pval < 0.01)
+  MW.cor.greater <- dplyr::bind_rows(cor.greater.list, .id="threshold") %>% mutate(group="greater") %>% filter(pval < 0.01)
+  
+  return(list(less=MW.cor.less, greater=MW.cor.greater))
+}
+
+```
+
+```{r}
+thresh.list <- MW.threshold(v.thresh = quantile(features.merged.transformed.w_pass$sequence_Mol.Weight_MW..Da., probs=seq(0.01,0.99, 0.01)), data=MW.df)
+```
+
+
+```{r}
+plot.data=do.call("rbind", thresh.list) %>% mutate(threshold=round(as.numeric(plot.data$threshold), digits=2))
+ggplot(data=plot.data, aes(x=threshold, y=cor, group=group)) + 
+  geom_point(aes(color=group)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  xlab("MW threshold (Da)") + ylab("spearman correlation") +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 20)) +
+scale_y_continuous(breaks = scales::pretty_breaks(n = 20))
+  
+```

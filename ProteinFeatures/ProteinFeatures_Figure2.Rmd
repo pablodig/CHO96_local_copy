@@ -1,0 +1,127 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(forcats)
+```
+
+
+####################################################################
+PLOT MOST IMP FEATURES OF BEST PERFORMING REGRESSION MODEL (RF)
+####################################################################
+
+```{r}
+var.imp <- openxlsx::read.xlsx("Output/regression_decriptive_results_subset_rmNA.xlsx", sheet="rmNA_rf_subset")
+feat.table <- openxlsx::read.xlsx("Output/featureTable2.xlsx", sheet="All features")
+var.imp <- var.imp %>% left_join(feat.table[, c("Feature.type", "Variable", "Variable_descriptive")], by=c("variable"="Variable")) %>%
+  plyr::rename(c("Variable_descriptive"="feature.name")) %>%
+  mutate(feature.name=fct_reorder(feature.name, Overall)) 
+
+# vector of colors to use for labels
+feat.col <- c("turquoise4", "magenta4")[network::as.color(var.imp$Feature.type)]
+```
+
+Figure 2C
+```{r}
+ggplot(var.imp, aes(x=feature.name, y=abs.r, fill=corr.dir)) + geom_col()+ coord_flip() +
+ ylab("Variable Importance") + 
+  theme(axis.title.x=element_blank()) + theme_gray(base_size = 25) +
+  guides(fill=guide_legend(title="Effect on yield")) +
+  scale_fill_manual(values=c("lightcoral", "gray72", "lightgreen")) +
+  theme(axis.text.y = element_text(colour = rev(feat.col))) +
+  xlab("Protein Feature")
+ggsave(file="Figures/ML_2C.png", width=13, height=6.5)
+```
+
+To get feature type legend
+Note: having issues with legend lable color
+Solution: plot twice, once with each color, and manipulate (copy/paste) later to get what you want
+```{r}
+var.imp$new.variable <- rep(1, nrow(var.imp)) # dummy variable
+
+ggplot(var.imp, aes(x=new.variable, y=abs.r, fill=Feature.type)) +geom_col() + coord_flip() +
+  ylab("Variable Importance") + 
+  theme(axis.title.x=element_blank()) + theme_gray(base_size = 20) +
+  scale_fill_manual(values=c("lightcoral", "gray72", "lightgreen")) +
+  theme(axis.text.y = element_text(colour = rev(feat.col))) +
+  xlab("Protein Feature") +
+  scale_fill_manual(values=c("turquoise4", "magenta4")) + labs(fill="Feature type") +
+  theme(legend.text = element_text(colour=c("turquoise4")), legend.key.size=unit(0.5, "cm"), legend.key.width = unit(0.25,"cm"))
+ggsave(file="Figures/ML_featureType1.png", width=4, height=4)
+
+ggplot(var.imp, aes(x=new.variable, y=abs.r, fill=Feature.type)) +geom_col() + coord_flip() +
+  ylab("Variable Importance") + 
+  theme(axis.title.x=element_blank()) + theme_gray(base_size = 20) +
+  scale_fill_manual(values=c("lightcoral", "gray72", "lightgreen")) +
+  theme(axis.text.y = element_text(colour = rev(feat.col))) +
+  xlab("Protein Feature") +
+  scale_fill_manual(values=c("turquoise4", "magenta4")) + labs(fill="Feature type") +
+  theme(legend.text = element_text(colour=c("magenta4")), legend.key.size=unit(0.5, "cm"), legend.key.width = unit(0.25,"cm"))
+ggsave(file="Figures/ML_FeatureType2.png", width=4, height=4)
+```
+
+
+####################################################################
+HEATMAP OF REGRESSION OVERLAP FEATURES (Figure 2A)
+####################################################################
+
+```{r}
+regression_df <- openxlsx::read.xlsx("Output/regression_varImp_rmNA.xlsx", sheet="feat.table") %>%
+  left_join(feat.table[, c("Feature.type", "Variable_model", "Variable_descriptive")], by=c("feature.name"="Variable_model"))
+feat.col_regression <- c("turquoise4", "magenta4")[network::as.color(regression_df$Feature.type)]
+```
+
+```{r}
+df.regression <- data.frame(x=rep("Regression", nrow(regression_df)), y=regression_df$Variable_descriptive, v=regression_df$Freq, i=nrow(regression_df):1) %>%
+  mutate(y=fct_reorder(y, i)) 
+
+png("Figures/ML_2A.png", width=670, height=655)
+ggplot(df.regression, aes(x,y, fill = as.factor(v))) + 
+  geom_tile(color="black", lwd=0.5) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_blank(), 
+        axis.ticks=element_blank(),
+        axis.title.x=element_blank(), axis.title.y=element_blank(),
+        axis.text.x=element_text(face="bold", size=28),
+        text=element_text(size=28)) +
+  scale_fill_brewer(palette="RdPu") +
+  scale_x_discrete(position = "top") + labs(fill="Consensus") +
+  theme(axis.text.y = element_text(colour = rev(feat.col_regression)))
+dev.off()
+```
+
+
+
+####################################################################
+HEATMAP OF CLASSIFICATION OVERLAP FEATURES (Figure 2B)
+####################################################################
+
+```{r}
+classification_df <- openxlsx::read.xlsx("Output/classification_varImp_rmNA_2class.xlsx", sheet="feat.table") %>%
+  left_join(feat.table[, c("Feature.type", "Variable_model", "Variable_descriptive")], by=c("feature.name"="Variable_model"))
+feat.col_classification <- c("turquoise4", "magenta4")[network::as.color(classification_df$Feature.type)]
+```
+
+```{r}
+df.classification <- data.frame(x=rep("Classification", nrow(classification_df)), y=classification_df$Variable_descriptive, v=classification_df$Freq, i=nrow(classification_df):1) %>%
+  mutate(y=fct_reorder(y, i)) 
+
+png("Figures/ML_2B.png", width=670, height=655)
+ggplot(df.classification, aes(x,y, fill = as.factor(v))) + 
+  geom_tile(color="black", lwd=0.5) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_blank(), 
+        axis.ticks=element_blank(),
+        axis.title.x=element_blank(), axis.title.y=element_blank(),
+        axis.text.x=element_text(face="bold", size=28),
+        text=element_text(size=28)) +
+  scale_fill_brewer(palette="RdPu") +
+  scale_x_discrete(position = "top") + labs(fill="Consensus") +
+  theme(axis.text.y = element_text(colour = rev(feat.col_classification)))
+dev.off()
+```
+

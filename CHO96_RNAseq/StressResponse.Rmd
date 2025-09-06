@@ -1,0 +1,609 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+STRESS SIGNAL
+CHO96
+
+Clear all previously loaded packages
+```{r}
+lapply(paste('package:',names(sessionInfo()$otherPkgs),sep=""),detach,character.only=TRUE,unload=TRUE)
+```
+
+Load packages
+```{r}
+library(data.table)
+library(dplyr)
+library(org.Hs.eg.db)
+library(EnhancedVolcano)
+library(ggplot2)
+library(GOplot)
+library(igraph)
+library(ggnet)
+library(ggraph)
+library(ggnetwork)
+library(stringr)
+```
+
+Load data
+```{r}
+list.TPM_pheno_map <- readRDS("Output/list.TPM_pheno_map.RDS")
+CHO96 <- list.TPM_pheno_map$pheno.data
+TPM.log <- list.TPM_pheno_map$TPM.log
+DEres <- readRDS("Output/DEanalysis/031822_DESeq2.RDS")
+
+## add WT annotation to amount_microgram to use as filter for downstream analyses
+CHO96$amount_microgram[CHO96$genes=="WT"] <- "WT"
+
+## response to stress genes (GO)
+Stress.GO <- fread("Data/GO-0033554_CellularResponseToStress.tsv") %>% mutate(SYMBOL.upper=toupper(SYMBOL))
+Stress.genes <- unique(Stress.GO$SYMBOL)
+```
+
+Subset TPM data to only include stress genes
+```{r}
+length(setdiff(Stress.genes, toupper(TPM.log$gene)))
+length(setdiff(Stress.genes, list.TPM_pheno_map$CHO.human_map$humanSymbol))
+
+## TPM log data used for correlations
+TPM.Stress <- left_join(TPM.log, list.TPM_pheno_map$CHO.human_map[, c("choSymbol", "humanSymbol")], by=c("gene"="choSymbol")) %>%
+  dplyr::select(humanSymbol, everything()) %>% filter(humanSymbol %in% Stress.genes) %>% dplyr::select(-c("gene", "sds")) %>%
+  group_by(humanSymbol) %>% summarize_each(funs(max)) %>% tibble::column_to_rownames(var="humanSymbol")
+
+## LFC data used for DE analyses
+LFC.non_vs_prod <- left_join(DEres$non_vs_prod_exWT, list.TPM_pheno_map$CHO.human_map[, c("choSymbol", "humanSymbol")], by=c("gene"="choSymbol")) %>%
+  dplyr::select(humanSymbol, everything()) %>% filter(humanSymbol %in% Stress.genes) %>%
+  group_by(humanSymbol) %>% summarize_each(funs(max)) #%>% tibble::column_to_rownames(var="humanSymbol")
+
+```
+
+#####################################################################
+Define functions:
+#####################################################################
+
+Correlation
+```{r}
+cor.test.hm <- function(x,y) {
+  res <- cor.test(x,y, method="spearman")
+  res.df <- data.frame(rho=res$estimate, pval=res$p.value)
+  return(res.df)
+}
+
+geneCorr <- function(group.col, group.info, exp.data) {
+  TPM.subset <- subset(exp.data, select=CHO96$sample_ID[CHO96[[group.col]] %in% group.info])
+  CHO96.subset <- CHO96[CHO96$sample_ID %in% colnames(TPM.subset) ,]
+  if (!identical(colnames(TPM.subset), CHO96.subset$sample_ID)) {
+    break
+  }
+  res.cor <- apply(TPM.subset, 1, cor.test.hm, y=CHO96.subset$Total.purified.protein_stock1.stock2_microg) %>% rbindlist(idcol=T, fill=T) %>%
+  dplyr::rename("gene"=".id") %>% mutate(padj=p.adjust(pval, method="BH"))
+}
+```
+
+Differential expression
+```{r}
+geneDE <- function(exp.data, alt, group1, group2) {
+  group1.exp <- exp.data[, colnames(exp.data) %in% CHO96$sample_ID[CHO96$amount_microgram %in% group1]]
+  group2.exp <- exp.data[, colnames(exp.data) %in% CHO96$sample_ID[CHO96$amount_microgram %in% group2]]
+  
+  keep <- matrixStats::rowSds(cbind(group1.exp, group2.exp)) >0.00000000001
+  group1.exp <- group1.exp[keep ,]
+  group2.exp <- group2.exp[keep ,]
+  identical(rownames(group1.exp), rownames(group2.exp))
+  
+  df <- data.table(gene=rownames(group1.exp), pval=rep(NA, nrow(group1.exp)), LFC=rep(NA, nrow(group1.exp)))
+  for (i in 1:nrow(group1.exp)) {
+    welch.test <- t.test(group1.exp[i,], group2.exp[i,], alternative=alt)
+    df$pval[i] <- welch.test$p.value
+    df$LFC[i] <- welch.test$estimate[1]-welch.test$estimate[2]
+  }
+  df <- df %>% mutate(padj=p.adjust(pval, method="BH"))
+  
+  return(df)
+}
+```
+
+Violin plot for genes of interest
+```{r}
+violin.genes <- function(select.genes, select.amount, plot.rows, col.pal, group=NA) {
+  #filter select genes to ensure present in tpm matrix
+  select.genes <- select.genes[select.genes %in% rownames(TPM.Stress)]
+  
+  XX <- TPM.Stress[rownames(TPM.Stress) %in% select.genes,]
+identical(colnames(XX), CHO96$sample_ID)
+XX.long <- data.table::transpose(XX) %>% `colnames<-`(rownames(XX)) %>% dplyr::mutate(amount=CHO96$amount_microgram) %>% dplyr::mutate(cell.line=CHO96$genes) %>%
+  tidyr::gather(stress.gene, tpm, select.genes, factor_key=TRUE)
+
+if(!is.null(dim(group))) {
+  XX.long <- left_join(XX.long, group, by=c("stress.gene"="gene"))
+  XX.long$stress.gene <- factor(XX.long$stress.gene, levels=unique(group$gene))
+  # plot
+  ggplot(data=XX.long, aes(x=stress.gene, y=tpm, fill=category)) + #, fill=stress.gene
+  scale_fill_brewer(palette=col.pal) +
+  geom_violin() +geom_boxplot(width=0.2, fill="white", outlier.shape = NA) + 
+  geom_point(data = XX.long[XX.long$amount %in% select.amount,], aes(x=stress.gene, y=tpm, color=amount, size=1.2)) +
+  scale_color_manual(values=c("highest amount"="#F8766D", 
+                     "lowest amount"="#00BA38", 
+                     "no amount"="#619CFF")) +
+  facet_wrap(~stress.gene, scales='free', nrow=plot.rows)}
+else {
+  ggplot(data=XX.long, aes(x=stress.gene, y=tpm)) + #, fill=stress.gene
+  #scale_fill_brewer(palette=col.pal) +
+  geom_violin(fill="#E78AC3") +geom_boxplot(width=0.2, fill="white", outlier.shape = NA) + 
+  geom_point(data = XX.long[XX.long$amount %in% select.amount ,], aes(x=stress.gene, y=tpm, color=amount, size=1.2)) +
+  scale_color_manual(values=c("highest amount"="#F8766D", 
+                     "lowest amount"="#00BA38", 
+                     "no amount"="#619CFF")) +
+  facet_wrap(~stress.gene, scales='free', nrow=plot.rows) }
+
+}
+```
+
+Custom color bar
+```{r}
+color.bar <- function(lut, min, max=-min, nticks=11, ticks=seq(min, max, len=nticks), title='') {
+    scale = (length(lut)-1)/(max-min)
+
+    dev.new(width=1.75, height=5)
+    plot(c(0,10), c(min,max), type='n', bty='n', xaxt='n', xlab='', yaxt='n', ylab='', main=title,cex.main=1.8)
+    axis(2, ticks, las=1, cex.axis=1.5)
+    for (i in 1:(length(lut)-1)) {
+     y = (i-1)/scale + min
+     rect(0,y,10,y+1/scale, col=lut[i], border=NA)
+    }
+}
+```
+
+#################################################
+Differential expression
+#################################################
+
+Using DESeq2 results
+```{r}
+DEstress_2FCsig <- data.table(LFC.non_vs_prod)[abs(log2FoldChange) > log2(2) & padj <=0.01 ,] %>% 
+  arrange(abs(log2FoldChange))
+DEstress_1.5FCsig <- data.table(LFC.non_vs_prod)[abs(log2FoldChange) > log2(1.5) & padj <=0.01 ,] %>% 
+  arrange(abs(log2FoldChange))
+
+## Add column with stress annotations
+DEstress_2FCsig_ann <- DEstress_2FCsig %>%
+  left_join(Stress.GO[, c("SYMBOL", "GO TERM", "GO NAME")], by=c("humanSymbol"="SYMBOL")) %>% distinct() %>%
+  arrange(abs(log2FoldChange))
+DEstress_1.5FCsig_ann <- DEstress_1.5FCsig %>%
+  left_join(Stress.GO[, c("SYMBOL", "GO TERM", "GO NAME")], by=c("humanSymbol"="SYMBOL")) %>% distinct() %>%
+  arrange(abs(log2FoldChange))
+```
+
+
+#################################################
+Save DE and cor results
+#################################################
+
+```{r}
+#openxlsx::write.xlsx(list(DE.Stress=LFC.non_vs_prod, DE.Stress.sig=DE.Stress.sig_ann), "Output/StressResponse_DE.xlsx")
+#openxlsx::write.xlsx(list(cor.Stress=cor.Stress, cor.Stress.sig=cor.Stress.sig), "Output/StressResponse_cor.xlsx")
+```
+
+
+#################################################
+Violin plots of interesting gene groups
+#################################################
+response to ER stress genes
+```{r}
+p.1 <- violin.genes(select.genes=DEstress_2FCsig_ann$humanSymbol[DEstress_2FCsig_ann$`GO NAME`=="response to endoplasmic reticulum stress"], 
+             select.amount = c("no amount"), plot.rows=2, col.pal = "Set3") +
+  theme(text=element_text(size=18))
+```
+
+response to ER stress genes
+```{r}
+p.1 <- violin.genes(select.genes=DEstress_2FCsig_ann$humanSymbol[DEstress_2FCsig_ann$`GO NAME`=="response to endoplasmic reticulum stress"], 
+             select.amount = c("no amount"), plot.rows=2, col.pal = "Set3") +
+  theme(text=element_text(size=18))
+```
+
+ATF6-mediated unfolded protein response
+```{r}
+p.2 <- violin.genes(select.genes=DEstress_1.5FCsig_ann$humanSymbol[DEstress_1.5FCsig_ann$`GO NAME`=="ATF6-mediated unfolded protein response"], 
+             select.amount = c("no amount"), plot.rows=1, col.pal = "Set2") +
+  theme(text=element_text(size=18))
+```
+
+IRE1-mediated unfolded protein response
+```{r}
+p.3 <- violin.genes(select.genes=DEstress_1.5FCsig_ann$humanSymbol[DEstress_1.5FCsig_ann$`GO NAME`=="IRE1-mediated unfolded protein response"], 
+             select.amount = c("no amount"), plot.rows=1, col.pal = "Set2") +
+  theme(text=element_text(size=18))
+```
+
+PERK-mediated unfolded protein response
+```{r}
+p.4 <- violin.genes(select.genes=DEstress_1.5FCsig_ann$humanSymbol[DEstress_1.5FCsig_ann$`GO NAME`=="PERK-mediated unfolded protein response"], 
+             select.amount = c("no amount"), plot.rows=1, col.pal = "Set2") +
+  theme(text=element_text(size=18))
+```
+
+combine into a single plot
+```{r}
+UPR.df <- rbind(data.frame(gene=DEstress_1.5FCsig_ann$humanSymbol[DEstress_1.5FCsig_ann$`GO NAME`=="PERK-mediated unfolded protein response"], category="UPR - PERK"),
+              data.frame(gene=DEstress_1.5FCsig_ann$humanSymbol[DEstress_1.5FCsig_ann$`GO NAME`=="IRE1-mediated unfolded protein response"], category="UPR - IRE1"),
+              data.frame(gene=DEstress_1.5FCsig_ann$humanSymbol[DEstress_1.5FCsig_ann$`GO NAME`=="ATF6-mediated unfolded protein response"], category="UPR - ATF6"))
+stress.df <- UPR.df[c(1,2,6,7,5,3,4) ,] %>%
+  rbind(data.frame(gene=DEstress_2FCsig_ann$humanSymbol[DEstress_2FCsig_ann$`GO NAME`=="response to endoplasmic reticulum stress"], category="response to ER stress"))
+
+#png("Figures/violin_stress.png", width=1000, height=500)
+violin.genes(select.genes = stress.df$gene, select.amount="no amount", plot.rows=2, col.pal="Set2", group=stress.df) +
+  theme(text=element_text(size=18.5), axis.ticks.x=element_blank(), axis.text.x=element_blank(), axis.title.x=element_blank()) + guides( size=FALSE)
+#dev.off()
+```
+
+```{r}
+#png("Figures/violin_stress.png", width = 1100, height = 800)
+ggpubr::ggarrange(p.1 + guides(color=FALSE, fill=FALSE, size=FALSE), 
+                  ggpubr::ggarrange(p.2+ guides(color=FALSE, fill=FALSE, size=FALSE), 
+                                    p.3 + guides(color=FALSE, fill=FALSE, size=FALSE), 
+                                    p.4 + guides(color=FALSE, fill=FALSE, size=FALSE), 
+                                    nrow=3), ncol=2)
+#dev.off()
+
+#png("Figures/violin_stress.png", width=900, height=800)
+ggpubr::ggarrange(p.1 + guides(color=FALSE, fill=FALSE, size=FALSE),
+                  p.UPR + guides(color=FALSE, fill=FALSE, size=FALSE), nrow=2, heights=c(2,1))
+#dev.off()
+```
+
+Oxidative stress genes
+```{r}
+ox.stress <- filter(DEstress_2FCsig_ann, `GO NAME` %in% c("cellular response to oxidative stress", 
+                                                          "cell death in response to oxidative stress",
+                                                          "intrinsic apoptotic signaling pathway in response to oxidative stress",
+                                                          "regulation of transcription from RNA polymerase II promoter in response to oxidative stress")) %>% 
+                      distinct() %>% 
+  mutate(shortName=gsub("odixative","ox",`GO NAME`))
+sum(ox.stress$log2FoldChange>0)
+sum(ox.stress$log2FoldChange<0)
+
+# just response to ox stress
+violin.genes(select.genes=DEstress_2FCsig_ann$humanSymbol[DEstress_2FCsig_ann$`GO NAME`=="cellular response to oxidative stress"], select.amount="no amount", plot.rows=3, col.pal="Set2") +
+  theme(text=element_text(size=18.5), axis.ticks.x=element_blank(), axis.text.x=element_blank(), axis.title.x=element_blank()) + guides(size=FALSE)
+
+#all ox stress related genes
+stress.df <- dplyr::select(ox.stress, c("humanSymbol", "shortName")) %>%
+  setNames(c("gene", "category"))
+
+ox.violin <- violin.genes(select.genes = stress.df$gene, select.amount="no amount", plot.rows=4, col.pal="Set2", group=stress.df) +
+  theme(text=element_text(size=16), axis.ticks.x=element_blank(), axis.text.x=element_blank(), axis.title.x=element_blank(), legend.position =c(0.65, 0.15)) + guides(size=FALSE, color=FALSE) + 
+  scale_fill_discrete(labels = function(x) stringr::str_wrap(x, width = 80)) +
+  guides(fill = guide_legend(override.aes = list(shape = NA)))
+
+#saveRDS(ox.violin, "Figures/R_plots/oxStress_violin.RDS")
+
+```
+
+
+#################################################
+Volcano plot of DE stress genes
+#################################################
+Ox stress genes
+```{r}
+## custom color for ox stress genes
+  keyvals <- ifelse(
+    LFC.non_vs_prod$humanSymbol %in% unique(ox.stress$humanSymbol), 'red',
+        'gray73')
+  keyvals[is.na(keyvals)] <- 'gray73'
+  names(keyvals)[keyvals == 'gray73'] <- 'other stress'
+  names(keyvals)[keyvals == 'red'] <- 'oxidative stress'
+  
+volcanoPlot <- EnhancedVolcano::EnhancedVolcano(LFC.non_vs_prod, 
+                                 lab=LFC.non_vs_prod$humanSymbol, 
+                                 selectLab = unique(ox.stress$humanSymbol),
+                                 x="log2FoldChange", 
+                                 y="padj", 
+                                 pCutoff = 0.01, 
+                                 FCcutoff = log2(2), 
+                                 #xlim=c(-3.5,2.5),
+                                 pointSize=3, 
+                                 legendLabSize = 16, 
+                                 colCustom = keyvals,
+                                 legendIconSize = 5.0,
+                                 drawConnectors = TRUE,
+                                 widthConnectors = 0.75,
+                                 typeConnectors = 'open',
+                                 caption = bquote(~Log[2]~ "fold change cutoff, 2; FDR cutoff, 0.01"),
+                                 xlab = bquote(~Log[2] ~ "fold change"),
+                                 ylab = bquote(~-Log[10] ~ italic(FDR)),
+                                 title="Differentially expressed stress response genes",
+                                 subtitle="failed producers vs successful producers")
+
+
+saveRDS(volcanoPlot, "Figures/R_plots/Figure5c.RDS")
+
+png("Figures/Fig5c.png", width=500, height=500)
+volcanoPlot
+dev.off()
+
+```
+
+
+#################################################
+Stress Network
+#################################################
+
+Correlation between stress genes and yield (among high and low producers)
+```{r}
+cor.Stress <- geneCorr(group.col= "amount_microgram", group.info = c("highest amount", "lowest amount"), exp.data = TPM.Stress) #unique(CHO96$amount_microgram), #c("highest amount", "lowest amount"), c("highest amount", "lowest amount", NA)
+
+cor.Stress.sig <- cor.Stress[padj <= 0.1 & abs(rho)>=0.6,] %>% mutate(gene=toupper(gene)) %>%
+  left_join(Stress.GO[, c("SYMBOL", "GO TERM", "GO NAME")], by=c("gene"="SYMBOL")) %>% distinct()
+
+length(unique(cor.Stress.sig$gene))
+cor.Stress.sig$gene[cor.Stress.sig$rho>0] %>% unique() %>% length()
+```
+
+Load STRING network and manually change names of certina genes/aliases to match gene name in dataset
+You can get the STRING Network from:
+NDEx_network(UUID="cfcd4cdb-86da-11e7-a10d-0ac135e8bacf", netName="STRING_Ideker")
+```{r}
+graph.STRING <- readRDS("Data/STRING_Ideker.RDS") 
+setdiff(DEstress_1.5FCsig$humanSymbol, V(graph.STRING)$n)
+V(graph.STRING)$name[V(graph.STRING)$name=="CHL1"] <- "DDX11"
+V(graph.STRING)$n[V(graph.STRING)$n=="CHL1"] <- "DDX11"
+```
+
+sig Cor genes (Supp FigS3b )
+```{r}
+g.cor <- induced_subgraph(graph.STRING, unique(cor.Stress.sig$gene))
+identical(V(g.cor)$name, cor.Stress$gene[match(V(g.cor)$name, cor.Stress$gene)])
+V(g.cor)$cor <- cor.Stress$rho[match(V(g.cor)$name, cor.Stress$gene)] %>% round(digits=2)
+
+## add node colors
+colfunc.node <- colorRampPalette(c("blue" ,"purple", "gray88", "orange", "yellow")) #c("purple", "gray88", "yellow")
+#colfunc.node <- colorRampPalette(c("#9E3D22", "gray88", "#2B5C8A"))
+node_cor.col <- data.frame(cor=round(seq(-1, 1, 0.001), digits=2), color=colfunc.node(length(seq(-1, 1, 0.001))))
+idx <- match(V(g.cor)$cor, node_cor.col$cor)
+identical(V(g.cor)$cor, node_cor.col$cor[idx])
+V(g.cor)$col <- node_cor.col$color[idx]
+
+set.seed(18)
+plot_g.cor <- ggnet2(g.cor, label=T, color=V(g.cor)$col, size=27, edge.size = 0.8) #arrow.size = 12, arrow.gap = 0.025
+#ggsave("Figures/FigS3b.svg", plot_g.cor, width = 9, height = 9)
+```
+
+Color bar
+```{r}
+#svg("Figures/stressCor_network_legend.svg", width=2, height=4)
+color.bar(colfunc.node(length(seq(-1, 1, 0.001))), -1, title="Correlation", ntick=3)
+#dev.off() 
+```
+
+
+#################################################
+GO chord plot
+#################################################
+
+```{r}
+binary.matrix <- function(data, genes, terms) {
+  dummy <- list()
+  for(i in genes) {
+    dummy[[i]] <- terms %in% data$term[data$gene==i] %>% as.numeric()
+  }
+  df.binary <- as.data.frame(do.call(rbind, dummy)) %>% setNames(terms) %>% 
+    mutate(gene=genes) %>% left_join(data[, c("gene", "logFC")]) %>% distinct() %>%
+    textshape::column_to_rownames(loc="gene")
+  return(df.binary)
+}
+```
+
+```{r}
+# Theme blank
+theme_blank <- theme(axis.line = element_blank(), axis.text.x = element_blank(),
+                     axis.text.y = element_blank(), axis.ticks = element_blank(), axis.title.x = element_blank(),
+                     axis.title.y = element_blank(), panel.background = element_blank(), panel.border = element_blank(),
+                     panel.grid.major = element_blank(), panel.grid.minor = element_blank(), plot.background = element_blank())
+
+# Bezier function for drawing ribbons
+bezier <- function(data, process.col){
+  x <- c()
+  y <- c()
+  Id <- c()
+  sequ <- seq(0, 1, by = 0.01)
+  N <- dim(data)[1]
+  sN <- seq(1, N, by = 2)
+  if (process.col[1] == '') col_rain <- grDevices::rainbow(N) else col_rain <- process.col
+  for (n in sN){
+    xval <- c(); xval2 <- c(); yval <- c(); yval2 <- c()
+    for (t in sequ){
+      xva <- (1 - t) * (1 - t) * data$x.start[n] + t * t * data$x.end[n]
+      xval <- c(xval, xva)
+      xva2 <- (1 - t) * (1 - t) * data$x.start[n + 1] + t * t * data$x.end[n + 1]
+      xval2 <- c(xval2, xva2)
+      yva <- (1 - t) * (1 - t) * data$y.start[n] + t * t * data$y.end[n]  
+      yval <- c(yval, yva)
+      yva2 <- (1 - t) * (1 - t) * data$y.start[n + 1] + t * t * data$y.end[n + 1]
+      yval2 <- c(yval2, yva2)			
+    }
+    x <- c(x, xval, rev(xval2))
+    y <- c(y, yval, rev(yval2))
+    Id <- c(Id, rep(n, 2 * length(sequ)))
+  }
+  df <- data.frame(lx = x, ly = y, ID = Id)
+  return(df)
+}
+
+# Check function for GOChord argument 'limit'
+check_chord <- function(mat, limit){
+  
+  if(all(colSums(mat) >= limit[2]) & all(rowSums(mat) >= limit[1])) return(mat)
+  
+  tmp <- mat[(rowSums(mat) >= limit[1]),]
+  mat <- tmp[,(colSums(tmp) >= limit[2])]
+  
+  mat <- check_chord(mat, limit)
+  return(mat)
+}
+
+GOChord_HM <- function(data, title, space, gene.order, gene.size, gene.space, nlfc = 1, lfc.col, lfc.min, lfc.max, ribbon.col, border.size, process.label, limit){
+  y <- id <- xpro <- ypro <- xgen <- ygen <- lx <- ly <- ID <- logFC <- NULL
+  Ncol <- dim(data)[2]
+  
+  if (missing(title)) title <- ''
+  if (missing(space)) space = 0
+  if (missing(gene.order)) gene.order <- 'none'
+  if (missing(gene.size)) gene.size <- 3
+  if (missing(gene.space)) gene.space <- 0.2
+  if (missing(lfc.col)) lfc.col <- c('brown1', 'azure', 'cornflowerblue')
+  if (missing(lfc.min)) lfc.min <- -3
+  if (missing(lfc.max)) lfc.max <- 3
+  if (missing(border.size)) border.size <- 0.5
+  if (missing (process.label)) process.label <- 11
+  if (missing(limit)) limit <- c(0, 0)
+  
+  if (gene.order == 'logFC') data <- data[order(data[, Ncol], decreasing = T), ]
+  if (gene.order == 'alphabetical') data <- data[order(rownames(data)), ]
+  if (sum(!is.na(match(colnames(data), 'logFC'))) > 0){
+    if (nlfc == 1){
+      cdata <- check_chord(data[, 1:(Ncol - 1)], limit)
+      lfc <- sapply(rownames(cdata), function(x) data[match(x,rownames(data)), Ncol])
+    }else{
+      cdata <- check_chord(data[, 1:(Ncol - nlfc)], limit)
+      lfc <- sapply(rownames(cdata), function(x) data[, (Ncol - nlfc + 1)])
+    }
+  }else{
+    cdata <- check_chord(data, limit)
+    lfc <- 0
+  }
+  if (missing(ribbon.col)) colRib <- grDevices::rainbow(dim(cdata)[2]) else colRib <- ribbon.col
+  nrib <- colSums(cdata)
+  ngen <- rowSums(cdata)
+  Ncol <- dim(cdata)[2]
+  Nrow <- dim(cdata)[1]
+  colRibb <- c()
+  for (b in 1:length(nrib)) colRibb <- c(colRibb, rep(colRib[b], 202 * nrib[b]))
+  r1 <- 1; r2 <- r1 + 0.1
+  xmax <- c(); x <- 0
+  for (r in 1:length(nrib)){
+    perc <- nrib[r] / sum(nrib)
+    xmax <- c(xmax, (pi * perc) - space)
+    if (length(x) <= Ncol - 1) x <- c(x, x[r] + pi * perc)
+  }
+  xp <- c(); yp <- c()
+  l <- 50
+  for (s in 1:Ncol){
+    xh <- seq(x[s], x[s] + xmax[s], length = l)
+    xp <- c(xp, r1 * sin(x[s]), r1 * sin(xh), r1 * sin(x[s] + xmax[s]), r2 * sin(x[s] + xmax[s]), r2 * sin(rev(xh)), r2 * sin(x[s]))
+    yp <- c(yp, r1 * cos(x[s]), r1 * cos(xh), r1 * cos(x[s] + xmax[s]), r2 * cos(x[s] + xmax[s]), r2 * cos(rev(xh)), r2 * cos(x[s]))
+  }
+  df_process <- data.frame(x = xp, y = yp, id = rep(c(1:Ncol), each = 4 + 2 * l))
+  xp <- c(); yp <- c(); logs <- NULL
+  x2 <- seq(0 - space, -pi - (-pi / Nrow) - space, length = Nrow)
+  xmax2 <- rep(-pi / Nrow + space, length = Nrow)
+  for (s in 1:Nrow){
+    xh <- seq(x2[s], x2[s] + xmax2[s], length = l)
+    if (nlfc <= 1){
+      xp <- c(xp, (r1 + 0.05) * sin(x2[s]), (r1 + 0.05) * sin(xh), (r1 + 0.05) * sin(x2[s] + xmax2[s]), r2 * sin(x2[s] + xmax2[s]), r2 * sin(rev(xh)), r2 * sin(x2[s]))
+      yp <- c(yp, (r1 + 0.05) * cos(x2[s]), (r1 + 0.05) * cos(xh), (r1 + 0.05) * cos(x2[s] + xmax2[s]), r2 * cos(x2[s] + xmax2[s]), r2 * cos(rev(xh)), r2 * cos(x2[s]))
+    }else{
+      tmp <- seq(r1, r2, length = nlfc + 1)
+      for (t in 1:nlfc){
+        logs <- c(logs, data[s, (dim(data)[2] + 1 - t)])
+        xp <- c(xp, (tmp[t]) * sin(x2[s]), (tmp[t]) * sin(xh), (tmp[t]) * sin(x2[s] + xmax2[s]), tmp[t + 1] * sin(x2[s] + xmax2[s]), tmp[t + 1] * sin(rev(xh)), tmp[t + 1] * sin(x2[s]))
+        yp <- c(yp, (tmp[t]) * cos(x2[s]), (tmp[t]) * cos(xh), (tmp[t]) * cos(x2[s] + xmax2[s]), tmp[t + 1] * cos(x2[s] + xmax2[s]), tmp[t + 1] * cos(rev(xh)), tmp[t + 1] * cos(x2[s]))
+      }}}
+  if(lfc[1] != 0){
+    if (nlfc == 1){
+      df_genes <- data.frame(x = xp, y = yp, id = rep(c(1:Nrow), each = 4 + 2 * l), logFC = rep(lfc, each = 4 + 2 * l))
+    }else{
+      df_genes <- data.frame(x = xp, y = yp, id = rep(c(1:(nlfc*Nrow)), each = 4 + 2 * l), logFC = rep(logs, each = 4 + 2 * l))  
+    }
+  }else{
+    df_genes <- data.frame(x = xp, y = yp, id = rep(c(1:Nrow), each = 4 + 2 * l))
+  }
+  aseq <- seq(0, 180, length = length(x2)); angle <- c()
+  for (o in aseq) if((o + 270) <= 360) angle <- c(angle, o + 270) else angle <- c(angle, o - 90)
+  df_texg <- data.frame(xgen = (r1 + gene.space) * sin(x2 + xmax2/2),ygen = (r1 + gene.space) * cos(x2 + xmax2 / 2),labels = rownames(cdata), angle = angle)
+  df_texp <- data.frame(xpro = (r1 + 0.15) * sin(x + xmax / 2),ypro = (r1 + 0.15) * cos(x + xmax / 2), labels = colnames(cdata), stringsAsFactors = FALSE)
+  cols <- rep(colRib, each = 4 + 2 * l)
+  x.end <- c(); y.end <- c(); processID <- c()
+  for (gs in 1:length(x2)){
+    val <- seq(x2[gs], x2[gs] + xmax2[gs], length = ngen[gs] + 1)
+    pros <- which((cdata[gs, ] != 0) == T)
+    for (v in 1:(length(val) - 1)){
+      x.end <- c(x.end, sin(val[v]), sin(val[v + 1]))
+      y.end <- c(y.end, cos(val[v]), cos(val[v + 1]))
+      processID <- c(processID, rep(pros[v], 2))
+    }
+  }
+  df_bezier <- data.frame(x.end = x.end, y.end = y.end, processID = processID)
+  df_bezier <- df_bezier[order(df_bezier$processID,-df_bezier$y.end),]
+  x.start <- c(); y.start <- c()
+  for (rs in 1:length(x)){
+    val<-seq(x[rs], x[rs] + xmax[rs], length = nrib[rs] + 1)
+    for (v in 1:(length(val) - 1)){
+      x.start <- c(x.start, sin(val[v]), sin(val[v + 1]))
+      y.start <- c(y.start, cos(val[v]), cos(val[v + 1]))
+    }
+  }	
+  df_bezier$x.start <- x.start
+  df_bezier$y.start <- y.start
+  df_path <- bezier(df_bezier, colRib)
+  if(length(df_genes$logFC) != 0){
+    tmp <- sapply(df_genes$logFC, function(x) ifelse(x > lfc.max, lfc.max, x))
+    logFC <- sapply(tmp, function(x) ifelse(x < lfc.min, lfc.min, x))
+    df_genes$logFC <- logFC
+  }
+  
+  g<- ggplot() +
+    geom_polygon(data = df_process, aes(x, y, group=id), fill='gray70', inherit.aes = F,color='black') +
+    geom_polygon(data = df_process, aes(x, y, group=id), fill=cols, inherit.aes = F,alpha=0.6,color='black') +	
+    geom_point(aes(x = xpro, y = ypro, size = factor(labels, levels = labels), shape = NA), data = df_texp) +
+    guides(size = guide_legend("GO Terms", ncol = 1, byrow = T, override.aes = list(shape = 22, fill = unique(cols), size = 10))) +
+    theme(legend.text = element_text(size = process.label)) +
+    geom_text(aes(xgen, ygen, label = labels, angle = angle), data = df_texg, size = gene.size) +
+    geom_polygon(aes(x = lx, y = ly, group = ID), data = df_path, fill = colRibb, color = 'black', size = border.size, inherit.aes = F) +		
+    labs(title = title) +
+    theme_blank
+  
+  if (nlfc >= 1){
+    g + geom_polygon(data = df_genes, aes(x, y, group = id, fill = logFC), inherit.aes = F, color = 'black') +
+      scale_fill_gradient2('logFC', space = 'Lab', low = lfc.col[3], mid = lfc.col[2], high = lfc.col[1], guide = guide_colorbar(title.position = "top", title.hjust = 0.5), 
+                           breaks = c(min(df_genes$logFC), max(df_genes$logFC)), labels = c(round(min(df_genes$logFC)), round(max(df_genes$logFC)))) +
+      theme(legend.position = 'bottom', legend.background = element_rect(fill = 'transparent'), legend.box = 'horizontal', legend.direction = 'horizontal')
+  }else{
+    g + geom_polygon(data = df_genes, aes(x, y, group = id), fill = 'gray50', inherit.aes = F, color = 'black')+
+      theme(legend.position = 'bottom', legend.background = element_rect(fill = 'transparent'), legend.box = 'horizontal', legend.direction = 'horizontal')
+  }
+}
+```
+
+Figure S3a (supplementary, old)
+```{r}
+# "double-strand break repair via homologous recombination"
+plot.terms <- c("cellular response to DNA damage stimulus", "DNA repair", "cellular response to hypoxia", "response to endoplasmic reticulum stress", "cellular response to oxidative stress")
+
+stress.subset <- DEstress_2FCsig_ann[DEstress_2FCsig_ann$`GO NAME` %in% plot.terms , c("humanSymbol", "GO TERM", "GO NAME", "log2FoldChange")] %>% 
+  setNames(c("gene", "ID", "term", "logFC"))
+chord <- binary.matrix(data=stress.subset, unique(stress.subset$gene), unique(stress.subset$term))
+g.chord <- GOChord_HM(chord, space=0.02, gene.order='logFC', gene.space = 0.25, gene.size = 3.5, process.label = 11) +
+  theme(legend.position='right',legend.background = element_rect(fill='transparent'),legend.box='vertical',legend.direction='vertical')
+```
+
+Figure 4b
+```{r}
+plot.terms <- c("response to endoplasmic reticulum stress", "ATF6-mediated unfolded protein response", "IRE1-mediated unfolded protein response", "PERK-mediated unfolded protein response", "ubiquitin-dependent ERAD pathway", "ERAD pathway")
+
+#LFC threshold same (1.5)
+stress.subset <- DEstress_1.5FCsig_ann[DEstress_1.5FCsig_ann$`GO NAME` %in% plot.terms , c("humanSymbol", "GO TERM", "GO NAME", "log2FoldChange")] %>% setNames(c("gene", "ID", "term", "logFC")) %>%
+  mutate(across('term', str_replace, 'response to endoplasmic reticulum stress', 'response to ER stress')) %>%
+  mutate(across('term', str_replace, 'PERK-mediated unfolded protein response', 'PERK-mediated UPR')) %>%
+  mutate(across('term', str_replace, 'IRE1-mediated unfolded protein response', 'IRE1-mediated UPR')) %>%
+  mutate(across('term', str_replace, 'ATF6-mediated unfolded protein response', 'ATF6-mediated UPR')) %>%
+  mutate(across('term', str_replace, 'ubiquitin-dependent ERAD pathway', 'Ub-dependent ERAD pathway'))
+
+
+chord <- binary.matrix(data=stress.subset, unique(stress.subset$gene), unique(stress.subset$term))
+g.chord <- GOChord_HM(chord, space=0.02, gene.order='logFC', gene.space = 0.25, gene.size = 4, process.label = 13) +
+  theme(legend.position='right',legend.background = element_rect(fill='transparent'),legend.box='vertical',legend.direction='vertical')
+
+saveRDS(g.chord, file="Figures/R_plots/Figure4b.RDS")
+```

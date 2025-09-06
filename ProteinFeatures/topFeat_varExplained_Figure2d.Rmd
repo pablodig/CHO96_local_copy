@@ -1,0 +1,110 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+lapply(paste('package:',names(sessionInfo()$otherPkgs),sep=""),detach,character.only=TRUE,unload=TRUE)
+```
+
+
+```{r}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(gghighlight)
+library(scales)
+```
+
+```{r}
+model <- readRDS("Output/modelList_regression_descriptive_microgram.RDS")
+feat.data <- model$rm.allNA$train.data %>% data.table()
+rf_res <- readxl::read_excel("Output/regression_descriptive_results.xlsx", sheet="rmNA_rf") %>% data.table()
+```
+
+```{r}
+top.feat <- rf_res[Overall>20, feature] %>% append("response.var",0)
+subset.features <- feat.data[, ..top.feat]
+```
+
+```{r}
+fit <- stats::lm(response.var ~ ., data=subset.features ) %>% summary
+#summary(fit)
+```
+
+Increasingly add more variables calculating var explained
+Hope to see an assymptote
+```{r}
+rf.varImp <- readxl::read_excel("Output/regression_varImp_rmNA.xlsx", sheet="randomForest") %>% data.table()
+```
+
+```{r}
+varExplained <- function(varImp, feat.data) {
+  list.var.exp <- list()
+  for (i in 1:nrow(varImp)) {
+    feat.subset <- varImp$feature[1:i] %>% append("response.var",0)
+    feat.data.subset <- feat.data[, ..feat.subset]
+    fit <- stats::lm(response.var ~ ., data=feat.data.subset ) %>% summary()
+    list.var.exp[[i]] <- data.table(num.var=i, var.exp=fit$adj.r.squared)
+  }
+  return(list.var.exp)
+}
+```
+
+```{r}
+df.var.exp <- varExplained(varImp=rf.varImp, feat.data = feat.data) %>% bind_rows()
+```
+
+```{r}
+df.var.exp$percent.exp <- label_percent(accuracy = 0.01)(df.var.exp$var.exp)
+
+png("Figures/Fig2D_1.png", width=500, height=350)
+ggplot(df.var.exp, aes(num.var, var.exp)) +   # Draw ggplot2 scatterplot with smooth curve
+  geom_point() +
+  theme(text=element_text(size=18)) +
+  geom_smooth(se = FALSE,
+              method = "loess",
+              formula = y ~ x) +
+  gghighlight(var.exp == max(df.var.exp$var.exp),
+              # preserve colour and modify alpha instead
+              unhighlighted_params = list(colour = NULL, alpha = 0.03)) +
+  geom_label(aes(label = percent.exp),
+               hjust = 1, vjust = -0.5, fill = "red", colour = "white", alpha= 0.5) +
+  ylim(0, 0.16) +
+  xlab("# variables incuded in fit") + ylab("variability explained")
+dev.off()
+```
+
+```{r}
+png("Figures/Fig2D_2.png", width=500, height=350)
+ggplot(df.var.exp, aes(num.var, var.exp)) +   # Draw ggplot2 scatterplot with smooth curve
+  geom_point() +
+  theme(text=element_text(size=18)) +
+  gghighlight(var.exp == max(df.var.exp$var.exp),
+              unhighlighted_params = list(colour = "grey")) +
+  geom_label(aes(label = percent.exp),
+               hjust = 1, vjust = -0.5, fill = "red", colour = "white", alpha= 0.5) +
+  ylim(0, 0.16) +
+  xlab("# variables incuded in fit") + ylab("variability explained")
+dev.off()
+```
+
+```{r}
+png("Figures/Fig2D_3.png", width=500, height=350)
+ggplot(df.var.exp, aes(num.var, var.exp)) +   # Draw ggplot2 scatterplot with smooth curve
+  geom_point() +
+  theme(text=element_text(size=18)) +
+  geom_smooth(se = FALSE,
+              method = "loess",
+              formula = y ~ x,
+              color = "blue") +
+  gghighlight(var.exp == max(df.var.exp$var.exp),
+              # preserve colour and modify alpha instead
+              unhighlighted_params = list(colour = NULL, alpha=0.3)) +
+  geom_label(aes(label = percent.exp),
+               hjust = 1, vjust = -0.5, fill = "red", colour = "white", alpha= 0.5) +
+  ylim(0, 0.16) +
+  xlab("# variables incuded in fit") + ylab("variability explained")
+dev.off()
+```
+

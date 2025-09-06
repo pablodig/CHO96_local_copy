@@ -1,0 +1,131 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+lapply(paste('package:',names(sessionInfo()$otherPkgs),sep=""),detach,character.only=TRUE,unload=TRUE)
+```
+
+```{r}
+library(caret)
+library(caretEnsemble)
+library(dplyr)
+library(gbm)
+library(Cubist)
+library(randomForest)
+library(data.table)
+library(tidyverse)
+library(caret)
+library(pls)
+library(ggplot2)
+library(glmnet)
+library(Matrix)
+library(ggpubr)
+library(caretEnsemble)
+library(klaR)
+library(nnet)
+library(kernlab)
+library(gbm)
+library(plyr)
+library(mboost)
+library(randomForest)
+```
+
+Load list of classification models
+```{r}
+modelList.class <- readRDS("Output/modelList_classification_descriptive.RDS")
+corr <- readRDS("Output/corrList_µg.RDS") 
+corr.fail0 <- corr$fail0 %>% lapply(. %>% tibble::rownames_to_column(., var="feature.name"))
+```
+
+
+```{r}
+modelPerformance.descriptive <- function(x.class, imp) { # class= multiClass OR 2Class, imp= knnImp OR rm.allNA
+  model.list <- as.caretList(modelList.class[[x.class]][[imp]]$modelList)
+  train.data <- modelList.class[[x.class]][[imp]]$train.data
+  ## Plot resampled performance of model list
+  resResample <- resamples(model.list)
+  plot_resamples <- dotplot(resResample, main=paste(x.class, imp, sep=":"))
+  #plot_kappa <- dotplot(resResample, metric="Kappa", main=aste(x.class, imp, sep=":"))
+  ## performance of predictions using train data
+  #ex.pred <- extractPrediction(model.list, testX=subset(train.data, select=-c(response.var)), testY=train.data$response.var)
+  ex.pred <- extractPrediction(model.list)
+  # plot with Rsquared values calculated using linear regression (lm)
+  # plot_modPerf <- xyplot(obs ~ pred | model, 
+  #      #data = ex.pred[ex.pred$dataType=="Training" ,], 
+  #      data = ex.pred,
+  #      panel = function(x, y, ...) {
+  #        panel.xyplot(x, y, ...)
+  #        lm1 <- lm(y ~ x)
+  #        lm1sum <- summary(lm1)
+  #        r2 <- lm1sum$adj.r.squared
+  #        panel.abline(a = lm1$coefficients[1], 
+  #                     b = lm1$coefficients[2])
+  #        panel.text(labels = bquote(italic(R)^2 == .(format(r2, digits = 3))),x = -1, y = 1)
+  #        },
+  #      as.table = TRUE, layout=c(7,1), main=names(modelList.class)[i])
+  # table of performance metric calculated using caret
+  test.performance <- lapply(as.character(unique(ex.pred$model)), function(x) {
+    #postResample(pred=filter(ex.pred, dataType=="Test" & model==x)$pred, obs=filter(ex.pred, dataType=="Test" & model==x)$obs)
+    postResample(pred=filter(ex.pred, model==x)$pred, obs=filter(ex.pred, model==x)$obs)
+  }) %>% setNames(as.character(unique(ex.pred$model)))
+  test.performance <- as.data.frame(do.call(rbind,test.performance))
+  ## variable importance
+  var.importance <- lapply(model.list, varImp) #scale=FALSE
+  return(list("plot_resamples"=plot_resamples, "performance.table"=test.performance, "varImp"=var.importance))
+}
+```
+
+```{r}
+performance_scale.list <- list(multi_rmNA=modelPerformance.descriptive(x.class="multiClass", imp="rm.allNA"),
+                               multi_knn=modelPerformance.descriptive(x.class="multiClass", imp="knnImp"), 
+                               class2.rmNA=modelPerformance.descriptive(x.class="2Class", imp="rm.allNA"), 
+                               class2.knn=modelPerformance.descriptive(x.class="2Class", imp="knnImp"))
+#saveRDS(performance_scale.list, "Output/class_performanceList_scaled.RDS")
+```
+
+VARIABLE IMPORTANCE FOR 2 CLASS MODELS
+```{r}
+var.importance.2class <- function(model.performance){
+  varImp.list <- lapply(model.performance$varImp, function(x) {purrr::pluck(x, "importance") %>% 
+      tibble::rownames_to_column("feature") %>%
+      dplyr::select(1,2) %>%
+      `colnames<-`(c("feature", "importance")) %>% left_join(modelList.class$featureName.map, by=c("feature"="feature.ID")) %>%
+      arrange(desc(importance))})
+  varImp.list.top <- lapply(varImp.list, function(x){slice(x, 1:10)})
+  varImp.df <- bind_rows(varImp.list.top, .id = "column_label") 
+  varImp.table <- table(as.character(varImp.df$feature.name)) %>% as.data.frame() %>% arrange(desc(Freq)) %>% dplyr::rename("feature.name"="Var1")
+  final.varImp.list <- varImp.list
+  final.varImp.list[['feat.table']] <- varImp.table
+  final.varImp.list[['top.features']] <- varImp.df
+  return(final.varImp.list)
+}
+```
+
+```{r}
+varImp.2class <- lapply(list(class2.rmNA=performance_scale.list$class2.rmNA, class2.knn=performance_scale.list$class2.knn), var.importance.2class)
+```
+
+
+VARIABLE IMPORTANCE FOR MULTI CLASS MODELS
+```{r}
+var.importance.multiClass <- function(model.performance){
+  varImp.list <- lapply(model.performance$varImp, function(x) {pluck(x, "importance") %>% 
+      tibble::rownames_to_column("feature") %>%
+      left_join(modelList.class$featureName.map, by=c("feature"="feature.ID"))})
+  return(varImp.list)
+}
+```
+
+```{r}
+varImp.multiClass <- lapply(list(multiClass.rmNA=performance_scale.list$multi_rmNA, multiClass.knn=performance_scale.list$multi_knn), var.importance.multiClass)
+```
+
+```{r}
+openxlsx::write.xlsx(append(varImp.2class$class2.rmNA, list(performance=performance_scale.list$class2.rmNA$performance.table %>% tibble::rownames_to_column("model"))),
+                     "Output/classification_varImp_rmNA_2class.xlsx")
+openxlsx::write.xlsx(append(varImp.multiClass$multiClass.rmNA, list(performance=performance_scale.list$multi_rmNA$performance.table %>% tibble::rownames_to_column("model"))),
+                     "Output/classification_varImp_rmNA_multiClass.xlsx")
+```
+

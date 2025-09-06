@@ -1,0 +1,517 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Clear all previously loaded packages
+```{r}
+lapply(paste('package:',names(sessionInfo()$otherPkgs),sep=""),detach,character.only=TRUE,unload=TRUE)
+```
+
+```{r}
+library(data.table)
+library(dplyr)
+library(org.Hs.eg.db)
+library(factoextra)
+library(ggplot2)
+library(stats)
+library(ggpmisc)
+library(ggforce)
+library(tidyverse)
+library(pheatmap)
+library(viridis)
+```
+
+Load data
+```{r}
+term2gene_secM <- data.table(readRDS("Data/secMfeizi_term2gene.RDS"))
+list.TPM_pheno_map <- readRDS("Output/list.TPM_pheno_map.RDS")
+CHO96 <- list.TPM_pheno_map$pheno.data
+```
+
+############################################################
+FUNCTIONS
+############################################################
+
+Correlation
+```{r}
+cor.test.hm <- function(x,y) {
+  res <- cor.test(x,y, method="spearman")
+  res.df <- data.frame(rho=res$estimate, pval=res$p.value)
+  return(res.df)
+}
+
+geneCorr <- function(group.info, exp.data) {
+  TPM.subset <- subset(exp.data, select=CHO96$sample_ID[CHO96$group.info %in% group.info])
+  CHO96.subset <- CHO96[CHO96$sample_ID %in% colnames(TPM.subset) ,]
+  if (!identical(colnames(TPM.subset), CHO96.subset$sample_ID)) {
+    break
+  }
+  res.cor <- apply(TPM.subset, 1, cor.test.hm, y=CHO96.subset$Total.purified.protein_stock1.stock2_microg) %>% rbindlist(idcol=T, fill=T) %>%
+  dplyr::rename("gene"=".id") %>% mutate(padj=p.adjust(pval, method="BH"))
+}
+```
+
+Gene score
+```{r}
+geneScore <- function(TPM.matrix){
+  threshold <- apply(TPM.matrix, 1, mean) %>% setNames(rownames(TPM.matrix))
+  geneScore.matrix=matrix(, nrow=nrow(TPM.matrix), ncol=ncol(TPM.matrix))
+  for (i in 1:nrow(TPM.matrix)){
+    geneScore.matrix[i,] <- 5*log((1+TPM.matrix[i,])/threshold[i])
+  }
+  geneScore.matrix <- geneScore.matrix %>% magrittr::set_rownames(rownames(TPM.matrix)) %>% magrittr::set_colnames(colnames(TPM.matrix))
+  return(geneScore.matrix)
+}
+```
+
+correlation between activity scores and protein abundance
+```{r}
+subsystem.correlation <- function(group.info, scoreMatrix) {
+  subsystemScore.subset <- scoreMatrix[, CHO96$group.info %in% group.info]
+  CHO96.subset <- CHO96[CHO96$genes %in% colnames(subsystemScore.subset) ,]
+  if (!identical(colnames(subsystemScore.subset), CHO96.subset$genes)) {
+    break
+  }
+  res.cor <- apply(subsystemScore.subset, 1, cor.test.hm, y=CHO96.subset$Total.purified.protein_stock1.stock2_microg) %>% 
+    rbindlist(idcol=T, fill=T) %>%
+    dplyr::rename("gene"=".id") %>% mutate(padj=p.adjust(pval, method="BH"))
+}
+```
+
+correlation within cluster
+```{r}
+geneCorr.cluster <- function(clust.id) {
+  samples <- clust.samples$sample_ID[clust.samples$cluster==clust.id]
+  TPM.subset <- TPM.log.secM[, samples]
+  CHO96.subset <- CHO96[CHO96$sample_ID %in% colnames(TPM.subset) ,]
+  if (!identical(colnames(TPM.subset), CHO96.subset$sample_ID)) {
+    break
+  }
+  res.cor <- apply(TPM.subset, 1, cor.test.hm, y=CHO96.subset$Total.purified.protein_stock1.stock2_microg) %>%
+    rbindlist(idcol=T, fill=T) %>%
+    dplyr::rename("gene"=".id") %>% mutate(padj=p.adjust(pval, method="BH"))
+}
+```
+
+plot significant correlations within each cluster
+```{r}
+sig.clust.cor <- function(clusterID, FDR.thresh, rho.thresh) {
+  
+  sig <- cluster.gene.corr[[clusterID]][padj <= FDR.thresh & abs(rho) >=rho.thresh,][order(-rho),] %>% 
+  left_join(secM_TPM.map[, c("choSymbol", "Subsystem")], by=c("gene"="choSymbol")) %>% dplyr::rename(FDR=padj) %>%
+  distinct()
+  
+  sig<- sig[order(Subsystem, -rho) ,][order(nrow(sig):1) ,]
+  sig$gene <- factor(sig$gene, levels=sig$gene)
+  
+  p.cor <- ggplot(sig, aes(x=gene, y=rho)) +
+  geom_segment( aes(x=gene, xend=gene, y=0, yend=rho, color=Subsystem), size=1.3, alpha=0.9) +
+  geom_point(aes(color=Subsystem, size=FDR)) +
+  coord_flip() +
+  theme_bw() + #theme_light()
+  ylab("Correlation with protein yield") +
+  xlab("secM gene") +
+  theme(text=element_text(size=17)) +
+  scale_y_continuous(breaks = seq(-1, 1, by = .2))
+  
+  return(list(sig.df=sig, sig.plot=p.cor))
+}
+```
+
+Anova by cluster
+```{r}
+anova.fxn <- function(x) {
+  return(tryCatch(car::Anova(lm(paste(x, "~ cluster"), data=anova.feat)) %>% as.data.frame(), 
+                  error=function(e) NULL))}
+```
+
+welch low vs high per cluster
+```{r}
+welch.cluster <- function(cluster.ID, exp.data, alt) {
+  high.prod <- data.clust[cluster2==cluster.ID & amount_microgram=="highest amount", sample_ID]
+  high.exp <- exp.data[, colnames(exp.data) %in% high.prod]
+  low.prod <- data.clust[cluster2==cluster.ID & amount_microgram=="lowest amount", sample_ID]
+  low.exp <- exp.data[, colnames(exp.data) %in% low.prod]
+  
+  keep <- matrixStats::rowSds(cbind(high.exp, low.exp)) >0.00000000001
+  high.exp <- high.exp[keep ,]
+  low.exp <- low.exp[keep ,]
+  identical(rownames(high.exp), rownames(low.exp))
+  
+  res.df <- data.table(gene=rownames(high.exp), pval=rep(NA, nrow(high.exp)))
+  for (i in 1:nrow(high.exp)) {
+    welch.test <- t.test(low.exp[i,], high.exp[i,], alternative=alt)
+    res.df$pval[i] <- welch.test$p.value
+    res.df$mean.x[i] <- welch.test$estimate[1]
+    res.df$mean.y[i] <- welch.test$estimate[2]
+  }
+  res.df <- res.df %>% mutate(padj=p.adjust(pval, method="BH"))
+  
+  return(res.df)
+}
+```
+
+Custom color bar
+```{r}
+color.bar <- function(lut, min, max=-min, nticks=11, ticks=seq(min, max, len=nticks), title='') {
+    scale = (length(lut)-1)/(max-min)
+
+    dev.new(width=1.75, height=5)
+    plot(c(0,10), c(min,max), type='n', bty='n', xaxt='n', xlab='', yaxt='n', ylab='', main=title,cex.main=1.8)
+    axis(2, ticks, las=1, cex.axis=1.5)
+    for (i in 1:(length(lut)-1)) {
+     y = (i-1)/scale + min
+     rect(0,y,10,y+1/scale, col=lut[i], border=NA)
+    }
+}
+```
+
+############################################################
+secM genes missing in CHO (or at least not mappable)
+############################################################
+
+CHO.human map has already been trimmed to only include genes in TPM matrix
+Dataframe of secM genes missing or not expressed in CHO:
+```{r}
+ori.map <- fread("ConversionTable/180405CHO_HUMAN_SYMBOL_ID_MAPPING_all.tsv") %>% .[, humanID:=as.character(humanID)]
+ori.TPM <- readRDS("Data/txi.cho.RDS") %>% .[["abundance"]] 
+
+# How many genes in our CHO tpm data is NOT mappable (not included in map): 6298/23706 (27%)
+length(setdiff(rownames(ori.TPM), ori.map$choSymbol))
+
+# How many human secM genes (feizi) are not in map: 16/581 (3%)
+length(setdiff(term2gene_secM$ENTREZID, ori.map$humanID))
+#View(term2gene_secM[term2gene_secM$ENTREZID %in% setdiff(term2gene_secM$ENTREZID, ori.map$humanID) ,])
+length(setdiff(term2gene_secM$gene_name, ori.map$humanSymbol))
+
+# subset map to only include secM genes
+m.entrez <- ori.map[ori.map$humanID %in% term2gene_secM$ENTREZID ,] %>% left_join(term2gene_secM, by=c("humanID"="ENTREZID")) %>%
+  mutate(ENTREZID=humanID)
+m.symbol <- ori.map[ori.map$humanSymbol %in% term2gene_secM$gene_name ,] %>% left_join(term2gene_secM, by=c("humanSymbol"="gene_name")) %>%
+  mutate(gene_name=humanSymbol)
+secM.human_CHO_map <- rbind(m.entrez, m.symbol) %>% distinct()
+
+# Subset map even further to only include genes in TPM data
+length(setdiff(secM.human_CHO_map$choSymbol, rownames(ori.TPM))) #12, that map to 33 unique human genes
+length(intersect(secM.human_CHO_map$choSymbol, rownames(ori.TPM))) #570 unique secM genes
+secM_TPM.map <- secM.human_CHO_map[secM.human_CHO_map$choSymbol %in% rownames(ori.TPM) ,] #filter human-CHO map to only include genes in 
+
+### discrepency between gene name in TPM, choSymbol, and secMs (aka have some TPM genes that match up with secM genes, however they are missing or hae a different alias in the map)
+manual.map <- data.frame(choSymbol="Ufd1l", gene_name="UFD1L") %>% rbind(data.frame(choSymbol="Vimp", gene_name="VIMP")) %>% 
+  rbind(data.frame(choSymbol="Park2", gene_name="PARK2")) %>% rbind(data.frame(choSymbol="Large", gene_name="LARGE")) %>%
+  rbind(data.frame(choSymbol="Gyltl1b", gene_name="GYLTL1B")) %>% rbind(data.frame(choSymbol="Rfwd2", gene_name="RFWD2")) %>%
+  left_join(term2gene_secM) %>% dplyr::rename(humanID=ENTREZID)
+#add genes back into map
+secM_TPM.map <- plyr::rbind.fill(secM_TPM.map, manual.map)
+
+#####
+missing.secM <- term2gene_secM[!(term2gene_secM$gene_name %in% secM_TPM.map$gene_name),]
+#setdiff(missing.secM$ENTREZID, ori.map$humanID) %>% length()
+setdiff(missing.secM$gene_name, ori.map$humanSymbol) # missing due to not being in map
+intersect(missing.secM$gene_name, ori.map$humanSymbol) # present in map, but missing in TPM data
+
+
+```
+SUMMARY: There are 581 unique Human secM genes (581 unique ENTREZIDs map 575 unique gene symbols)
+16 human secM genes are not found in our CHO-Human map; 9 secM genes from map can't be found in our TPM data
+The result is a map of 556 unique secM genes (16+9+556=581) that map to 570 unique CHO genes
+We lost a total of 25 secM genes (16 due to missing in map, 9 due to missing in TPM data)
+
+Subset transcriptomics data to only include secMs (REMEMBER TO REMOVE BAD SAMPLES: "P6975_194", "P6975_108")
+```{r}
+TPM.secM <- ori.TPM[rownames(ori.TPM) %in% secM_TPM.map$choSymbol ,]
+TPM.log.secM <- log2(TPM.secM + 0.001)
+```
+
+How many of the secM genes are not expressed or super lowly expressed?
+```{r}
+secM.0 <- secM_TPM.map[secM_TPM.map$choSymbol %in% rownames(TPM.secM)[matrixStats::rowSums2(TPM.secM) == 0] ,]
+low.count <- apply(TPM.secM, 1, function(x) {sum(x<1)})
+```
+
+############################################################
+Correaltion between secM expression and titers
+############################################################
+exclude WT and non producers
+```{r}
+# "highest cell count", "highest viability", "highest amount", "lowest amount", "lowest viability", "lowest cell count", "no amount", "WT" 
+cor.genes <- geneCorr(group.info = c("highest cell count", "highest viability", "highest amount", "lowest amount", "lowest viability", "lowest cell count"), exp.data = TPM.log.secM) %>% left_join(secM_TPM.map[, c("choSymbol", "Subsystem")], by=c("gene"="choSymbol"))
+
+summary(cor.genes$padj)
+```
+Result: no specific secM genes correlate with titers
+
+############################################################
+Calculate sec pathway activty scores (13 subsystems)
+############################################################
+
+```{r}
+# remove zero genes
+TPM.matrix <- TPM.secM[!(rownames(TPM.secM) %in% secM.0$choSymbol) ,]
+```
+
+```{r}
+geneScore.matrix <- geneScore(TPM.matrix = TPM.matrix)
+```
+
+List of sample scores by subsystem
+```{r}
+#list of scores for each subsystem
+subsystemScore.list=list()
+for (subsystem in unique(term2gene_secM$Subsystem)) {
+  subsystem.genes <- secM_TPM.map[secM_TPM.map$Subsystem==subsystem ,]
+  geneScore.subset <- geneScore.matrix[rownames(geneScore.matrix) %in% subsystem.genes$choSymbol ,]
+  subsystemScore.list[[subsystem]] <- colSums(geneScore.subset)/nrow(geneScore.subset)
+}
+
+#dataframe (rows=subsystems, cols=sample)
+subsystemScore.df <- do.call("rbind", subsystemScore.list)
+data.frame(avg=apply(subsystemScore.df, 1, mean), stdev=apply(subsystemScore.df, 1, stats::sd))
+```
+
+Visualization with pheatmap
+```{r}
+identical(colnames(subsystemScore.df), CHO96$sample_ID)
+openxlsx::write.xlsx(as.data.frame(subsystemScore.df), "Output/secPathway_subsystem_scores.xlsx", rowNames=TRUE)
+colnames(subsystemScore.df) <- CHO96$genes
+row.ann <- data.frame(group.info=CHO96$group.info) %>% `rownames<-` (CHO96$genes)
+
+##### Normalize change in pathway activity
+WT <- subsystemScore.df[,colnames(subsystemScore.df)=="WT"] %>% setNames(rownames(subsystemScore.df)) %>%
+  as.matrix
+pathway.sds <- matrixStats::rowSds(as.matrix(subsystemScore.df[, 1:95])) %>% setNames(rownames(subsystemScore.df))
+
+delta_subsystemScore <- apply(subsystemScore.df, 2, function(x) {x-WT}) %>% `rownames<-` (rownames(subsystemScore.df)) %>% 
+  apply(2, function(x){x/pathway.sds})
+
+
+###### plot
+#row.ann.95 <- data.frame(group.info=CHO96$group.info[1:95]) %>% `rownames<-` (CHO96$genes[1:95])
+row.ann.95 <- CHO96[1:95, c("amount_microgram", "conc", "viability")] %>% `rownames<-` (CHO96$genes[1:95]) %>% `colnames<-` (c("amount", "concentration", "viability"))
+ann.col <- list(amount=c("highest amount"="#F8766D", "lowest amount"="#00BA38", "no amount"="#619CFF"), concentration=c("highest concentration"="slateblue4", "lowest concentration"="slateblue1"), viability=c("highest viability"="#d37703", "lowest viability"="#fcbb68"))
+ann.col <- list(amount=c("highest amount"="#00356b", "lowest amount"="#66b2ff", "no amount"="red"), concentration=c("highest concentration"="#64064b", "lowest concentration"="#f890dc"), viability=c("highest viability"="#d37703", "lowest viability"="#fcbb68"))
+
+row.ann.95 <- data.frame(amount=CHO96$amount_microgram[1:95]) %>% `rownames<-` (CHO96$genes[1:95]) 
+ann.col <- list(amount=c("highest amount"="#F8766D", "lowest amount"="#00BA38", "no amount"="#619CFF"))
+
+paletteLength=90
+myColor <- colorRampPalette(c("navy", "white", "firebrick3"))(paletteLength)
+myBreaks <- c(seq(min(delta_subsystemScore[,-96]), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(max(delta_subsystemScore[,-96])/paletteLength, max(delta_subsystemScore[,-96]), length.out=floor(paletteLength/2)))
+
+## cluster by rows
+png("Figures/Figure4a.png", width=550, height=800)
+clust <- pheatmap(t(delta_subsystemScore[,-96]), fontsize=18, fontsize_col=15,
+                               cluster_rows = T, cluster_cols = T, annotation_row = row.ann.95, gaps_col=T, cutree_rows=4, annotation_colors = ann.col, show_rownames=F, color=myColor, breaks=myBreaks, annotation_legend = F)
+dev.off()
+
+saveRDS(clust, "Figures/R_plots/Figure4a.RDS")
+
+clust.samples <- cutree(clust$tree_row, k=4) %>% as.data.frame() %>% setNames("cluster") %>% rownames_to_column(var="gene")
+identical(clust.samples$gene, CHO96$genes[1:95])
+clust.samples <- clust.samples %>% mutate(sample_ID=CHO96$sample_ID[1:95], yield=CHO96$Total.purified.protein_stock1.stock2_microg[1:95])
+```
+
+Plot WT
+```{r}
+#png("Figures/Figure4a_WT.png", width=330, height=400)
+pheatmap(cbind(WT[clust$tree_col$order,], WT[clust$tree_col$order,]), border_color=NA, cluster_rows=F, 
+         fontsize=17, fontsize_row = 21, main="WT") +
+  theme(plot.title = element_text(hjust = 0.7)) 
+#dev.off()
+```
+
+Correlation between subsystem scores and protein abundance
+```{r}
+subsystem.cor <- subsystem.correlation(group.info = c("highest cell count", "highest viability", "highest amount", "lowest amount", "lowest viability", "lowest cell count"), scoreMatrix = delta_subsystemScore) 
+```
+
+
+** Per reviewers request: redo heatmap, but order rows by yield
+```{r}
+df.tmp <- t(delta_subsystemScore[,-96])
+df.yield.tmp <- dplyr::select(CHO96, c("genes", "Total.purified.protein_stock1.stock2_microg"))[-96 ,] %>%
+  arrange(desc(Total.purified.protein_stock1.stock2_microg))
+df.reorder <- df.tmp[match(df.yield.tmp$genes, rownames(df.tmp)) ,]
+
+## Add row annotations according to correlation
+
+## add node colors
+colfunc <- colorRampPalette(c("red","yellow","cyan","blue"))
+#colfunc.node <- colorRampPalette(c("#9E3D22", "gray88", "#2B5C8A"))
+systemCor.col <- data.frame(cor=round(seq(0, 0.5, 0.01), digits=2), color=colfunc(length(seq(0, 0.5, 0.01))))
+idx <- match(round(subsystem.cor$rho, digits = 2), systemCor.col$cor)
+identical(round(subsystem.cor$rho, digits = 2), systemCor.col$cor[idx])
+annotation.col <- data.frame(correlation=systemCor.col$color[idx]) %>% `rownames<-`(subsystem.cor$gene)
+ann.col$correlation= systemCor.col$color[idx] %>% setNames(systemCor.col$color[idx])
+
+
+
+## plot pheatmap  
+png("Figures/FigureS4.png", width=550, height=800)
+clust <- pheatmap(df.reorder, fontsize=18, fontsize_col=15,
+                               cluster_rows = F, cluster_cols = T, annotation_row = row.ann.95, annotation_col = annotation.col, gaps_col=T, annotation_colors = ann.col, show_rownames=F, color=myColor, breaks=myBreaks, annotation_legend = T)
+dev.off()
+
+rm(df.tmp)
+rm(df.yield.tmp)
+rm(df.reorder)
+
+
+color.bar(colfunc(length(seq(0, 0.5, 0.01))), min=0, max=0.5, title="", ntick=3)
+
+```
+
+
+############################################################
+Correlations within each cluster
+############################################################
+Given a secretory pathway phenotype (belonging to a cluster... respond/stressed out in a similar fashion, are there certain genes that can rescue protein secretion?)
+
+
+Calculate correlations within each cluster
+```{r}
+cluster.gene.corr <- lapply (c(1:3), geneCorr.cluster) %>% setNames(c(1:3))
+
+### add column for sybsystem
+clust3.cor.suppMat <- cluster.gene.corr$`3`[order(-rho),] %>% 
+  left_join(secM_TPM.map[, c("choSymbol", "Subsystem")], by=c("gene"="choSymbol")) %>% dplyr::rename(FDR=padj) %>%
+  distinct()
+openxlsx::write.xlsx(clust3.cor.suppMat, "Output/Cluster3_cor.xlsx")
+
+## summary of FDR and Rho
+lapply(cluster.gene.corr, function(x){summary(x$padj)})
+lapply(cluster.gene.corr, function(x){summary(x$rho)})
+```
+Note that cluster 3 is the only cluster with significant correlations
+
+```{r}
+sigClust.3 <- sig.clust.cor(clusterID='3', FDR.thresh=0.1, rho.thresh=0.6)
+#sigClust.2 <- sig.clust.cor(clusterID='2', FDR.thresh=0.1, rho.thresh=0.6)
+#sigClust.1 <- sig.clust.cor(clusterID='1', FDR.thresh=0.1, rho.thresh=0.6)
+
+saveRDS(sigClust.3$sig.plot, "Figures/R_plots/Figure4c.RDS")
+```
+
+Plot distribution of protein titer for each cluster
+```{r}
+df <- clust.samples[clust.samples$cluster != 4 ,] %>% mutate(cluster2=cluster)
+df$cluster2[df$cluster==1] <- 2
+df$cluster2[df$cluster==2] <- 1
+
+mu <- plyr::ddply(df, "cluster", summarise, grp.mean=mean(yield))
+ggplot(df, aes(x=yield, fill=as.factor(cluster))) + geom_density(alpha=0.4) +
+  geom_vline(data=mu, aes(xintercept=grp.mean, color=as.factor(cluster)),linetype="dashed", show.legend = F) + 
+  labs(fill = "Cluster") + xlab("abundance (μg)") + theme_bw() + theme(text=element_text(size=15))
+
+#Note: 2 is 1, 1 is 2
+data.clust <- df %>% left_join(CHO96[, c("sample_ID", "amount_microgram")]) %>% data.table()
+```
+
+############################################################
+Quantify var explained in Cluster 3
+############################################################
+```{r}
+select.genes <- c("Alg12","Derl2", "Rpn1", "Rpn2", "Ddost")
+select.samples <- clust.samples$sample_ID[clust.samples$cluster %in% 3]
+TPM.subset <- subset(TPM.log.secM, select=select.samples) %>% t() %>% as.data.frame()
+response.var <- CHO96[CHO96$sample_ID %in% select.samples, c("sample_ID", "Total.purified.protein_stock1.stock2_microg")]
+identical(rownames(TPM.subset), response.var$sample_ID)
+TPM.subset <- subset(TPM.subset, select=select.genes) %>%
+  mutate(response.var=log10(response.var$Total.purified.protein_stock1.stock2_microg + 0.001))
+
+corrplot::corrplot(cor(TPM.subset), method="circle", addCoef.col = 1, tl.cex = 1.2)
+
+fit.subset <- dplyr::select(TPM.subset, c("Alg12", "Derl2", "response.var"))
+fit <- stats::lm(response.var ~ ., data=fit.subset )
+
+summary(fit)
+car::avPlots(fit, marginal.scale=F, id=F)
+```
+
+
+############################################################
+Are clusters characterized by specific protein features
+############################################################
+load protein fetures used in ML
+```{r}
+protFeat <- readRDS("Output/protFeatures96.RDS") %>% left_join(clust.samples) #%>% mutate(cluster=as.factor(cluster))
+
+protFeat.all <- readRDS("../ProteinFeatures/Output/Tegel2020_allFeatures.RDS")
+protFeat.subset <- protFeat.all$features_allSamples %>% 
+  right_join(clust.samples, by=c("human_symbol"="gene")) %>%
+  dplyr::filter(cluster != 4) %>%
+  mutate(cluster=as.factor(cluster))
+```
+
+Anova
+```{r}
+anova.feat <- dplyr::select(protFeat.subset, "abundance_GTEx_Adipose":cluster)
+colnames(anova.feat) <-str_replace(names(anova.feat), "%", "percent")
+colnames(anova.feat) <- str_replace(names(anova.feat), "-", "_")
+
+# run anova for ever protein feature
+res.anova <- sapply(names(anova.feat)[-219], anova.fxn) %>%
+  lapply(function(x) {x$`Pr(>F)`[1]})
+
+summary(unlist(res.anova))
+View(sort(unlist(res.anova)))
+```
+Note: no defining features in each cluster
+
+############################################################
+Compare secM exp low vs high prod in each cluster
+############################################################
+
+two-sided welch test comparing low vs high producers in each cluster
+```{r}
+welch.cluster(1, TPM.log.secM, alt="two.sided")[padj <=0.1 ,] %>%
+  mutate(LFC=mean.x-mean.y)
+welch.cluster(2, TPM.log.secM, alt="two.sided")[padj <=0.1 ,]
+welch.cluster(3, TPM.log.secM, alt="two.sided")[padj <=0.1 ,]
+```
+
+Look at GPI PTM in Cluster 1
+```{r}
+# which rProteins in Cluster 1 contain GPI anchor PTM -- NONE
+dplyr::select(protFeat.subset, c("human_symbol", "sequence_PSIM_GPI", "sequence_PTM.detailed_Lipidation__GPI.anchor")) %>%
+  left_join(data.clust, by=c("human_symbol"="gene")) %>% na.omit() #%>%View()
+
+# load list of host HCP proteins in CHO [10.1038/srep28547]
+GPI.HCP <- openxlsx::read.xlsx("Data/protFeatures/IoscaniJimenez_2016.xlsx", sheet="ST10 - GAG and GPI", startRow=3, colNames=T, check.names=T) %>% 
+  dplyr::select(c("Entry.Name", "GPI.Anchor")) %>%
+  dplyr::filter(GPI.Anchor==1) %>% 
+  mutate(geneName=gsub("_.*","",Entry.Name)) %>%
+  left_join(dplyr::select(list.TPM_pheno_map$CHO.human_map, c("choSymbol", "humanSymbol")), by=c("geneName"="humanSymbol"))
+
+# load other list of GPI anchor proteins from secRecon (need to map to gene names)
+CHOmap <- fread("ConversionTable/geneInfo_cho_simple.tsv") %>% # map entrezID to gene name
+  mutate(GeneID=as.character(GeneID)) %>%
+  # map uniprotID to entrezID
+  inner_join(openxlsx::read.xlsx("ConversionTable/CHOProtein.xlsx"), by=c("GeneID"="ENTREZ_GENE"))
+PSIM.GPI <- openxlsx::read.xlsx("Data/protFeatures/PSIM_matrix.xlsx", sheet="Chinese hamster") %>%
+  filter(GPI==1) %>% 
+  left_join(dplyr::select(CHOmap, c("UNIPROTKB", "Symbol")), by=c("Entry"="UNIPROTKB"))
+  
+# combine
+GPI.symbol <- c(GPI.HCP$choSymbol, PSIM.GPI$Symbol) %>% na.exclude()
+
+# extract expression (TPM) of the CHO GPI 
+TPM.GPI <- dplyr::select(list.TPM_pheno_map$TPM.log, -sds) %>%
+  subset(gene %in% GPI.symbol) %>% na.omit() %>% distinct()
+
+#two-sided welch test comparing the expression of GPI-anchor poteins in low vs high producers
+exp.data= tibble::column_to_rownames(TPM.GPI, "gene") %>% as.matrix()
+
+welch.cluster(1, exp.data, alt="two.sided")[padj <=0.1 ,] #cluster 1
+welch.cluster(2, exp.data, alt="two.sided")[padj <=0.1 ,] #cluster 2
+welch.cluster(3, exp.data, alt="two.sided")[padj <=0.1 ,] #cluster 3
+
+
+```
+Note: No differences in GPI-anchor protiens. The difference in GPI-anchor synthesis gene is prob artifact of being very lowly expressed.
+
+
+
+

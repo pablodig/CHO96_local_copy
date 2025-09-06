@@ -1,0 +1,28 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(data.table)
+library(dplyr)
+```
+
+
+```{r}
+TPM <- openxlsx::read.xlsx("Input/CHO96.countData.xlsx", sheet="TPM", rowNames=T) %>%
+  tibble::rownames_to_column(var="gene")
+CHOmap <- fread("../ConversionTable/geneInfo_cho_simple.tsv")
+```
+
+```{r}
+TPM.entrez <- left_join(TPM, select(CHOmap, c("GeneID", "Symbol")), by=c("gene"="Symbol")) %>%
+  na.omit() %>%
+  select(-gene) %>%
+  select(GeneID, everything())
+```
+
+```{r}
+fwrite(TPM.entrez, "Input/TPM_entrez.csv")
+```
+

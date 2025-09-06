@@ -1,0 +1,334 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+lapply(paste('package:',names(sessionInfo()$otherPkgs),sep=""),detach,character.only=TRUE,unload=TRUE)
+```
+
+```{r}
+#library(GMCM)
+library(data.table)
+library(dplyr)
+library(factoextra)
+library(tidyr)
+library(ggpubr)
+library(gplots)
+library(RColorBrewer)
+library(tidyverse)
+library(treemap)
+library(treemapify)
+```
+
+____________________________________________________________________________________________________________
+PREPARE DATA
+____________________________________________________________________________________________________________
+
+PreProcess Data:
+```{r}
+## Load data
+IDtable <- data.table(openxlsx::read.xlsx("runCellFie/Input/CHO96.countData.xlsx",
+                                          sheet = "IDtable"))
+cellFIE <- fread("runCellFie/Output/CHO96_TPM_results/score.csv") %>% 
+  as.matrix() # row=samples, col=cellFIE task
+cellFIE.binary <- fread("runCellFie/Output/CHO96_TPM_results/scoreBinary.csv") %>% as.matrix()
+list.TPM_pheno_map <- readRDS("Output/list.TPM_pheno_map.RDS")
+CHO96 <- list.TPM_pheno_map$pheno.data
+## add WT annotation to amount_microgram to use as filter for downstream analyses, modify NA to "other"
+CHO96$amount_microgram[CHO96$genes=="WT"] <- "WT"
+CHO96$amount_microgram[is.na(CHO96$amount_microgram)] <- "other"
+
+taskInfo <- fread("runCellFie/Output/CHO96_TPM_results/taskInfo.csv") %>% setNames(c("taskID", "task", "System", "Subsystem"))
+
+## add row and col names
+rownames(cellFIE) <- taskInfo$task
+colnames(cellFIE) <- IDtable$sample_ID
+rownames(cellFIE.binary) <- taskInfo$task
+colnames(cellFIE.binary) <- IDtable$sample_ID
+
+## Remove non-varying/zero score tasks
+#CellFIE
+sum(GMCM:::rowSds(cellFIE)==0)
+cellFIE <- cellFIE[!(GMCM:::rowSds(cellFIE)==0) ,]
+sum(GMCM:::rowSds(cellFIE)==0)
+#CellFIE.binary
+sum(matrixStats::rowMins(cellFIE.binary)==-1) #how many tasks were unable to be calculated
+cellFIE.binary <- cellFIE.binary[!matrixStats::rowMins(cellFIE.binary)==-1 ,] #remove
+sum(matrixStats::rowMins(cellFIE.binary)==-1)
+#check
+identical(rownames(cellFIE), rownames(cellFIE.binary))
+
+## Modify names to more interpretable gene names
+identical(colnames(cellFIE), list.TPM_pheno_map$pheno.data$sample_ID)
+colnames(cellFIE) <- CHO96$genes
+colnames(cellFIE.binary) <- CHO96$genes
+
+```
+
+```{r}
+# Which tasks are active in all cell lines (inlcuding WT)
+sum(rowSums(cellFIE.binary)==96)
+active.df <- cellFIE.binary[rowSums(cellFIE.binary)==96, ] %>% 
+  as.data.frame() %>%
+  tibble::rownames_to_column("task") %>%
+  left_join(taskInfo[, c("task", "System", "Subsystem")]) %>%
+  select(task, System, Subsystem)
+
+# Which tasks are inactive in all cell lines (including WT)
+sum(rowSums(cellFIE.binary)==0)
+inactive.df <- cellFIE.binary[rowSums(cellFIE.binary)==0,] %>% 
+  as.data.frame() %>%
+  tibble::rownames_to_column("task") %>%
+  left_join(taskInfo[, c("task", "System", "Subsystem")]) %>%
+  select(task, System, Subsystem)
+
+# Trim cellFIE binary to only include tasks that differ
+sum(GMCM:::rowSds(cellFIE.binary)==0)
+cellFIE.diff.binary <- cellFIE.binary[!GMCM:::rowSds(cellFIE.binary)==0 ,]
+diff_active.df <- cellFIE.binary[!GMCM:::rowSds(cellFIE.binary)==0 ,] %>% 
+  as.data.frame() %>%
+  tibble::rownames_to_column("task") %>%
+  left_join(taskInfo[, c("task", "System", "Subsystem")]) %>%
+  select(task, System, Subsystem)
+
+```
+
+Figure 5A: Pie chart showing percentage of active/in-active/diff-active tasks
+```{r}
+pie.data <- data.frame(group=c("active", "inactive", "differentially active"), value=c(79, 27, 79))
+pie.data <- pie.data %>% 
+  arrange(desc(group)) %>%
+  mutate(prop = value / sum(pie.data$value) *100) %>%
+  mutate(ypos = cumsum(prop)- 0.5*prop )
+
+pie <- ggplot(pie.data, aes(x="", y=prop, fill=group)) +
+  geom_bar(stat="identity", width=1, color="white") +
+  coord_polar("y", start=0) +
+  theme_void() +
+  theme(legend.position="none") +
+  geom_text(aes(y = ypos, label = group), color = "white", size=5) +
+  #scale_fill_grey()
+  scale_fill_manual(values=c("gray14", "gray36", "gray69"))
+  #scale_fill_brewer(palette="Set1")
+ggsave("Figures/Fig5a_pie.svg", pie, width = 5, height = 5)
+
+### active sub-chart
+data <- as.data.frame(table(active.df$System)) %>% 
+  right_join(as.data.frame(table(taskInfo$System)) %>% select(Var1)) %>% replace(is.na(.), 0) %>%
+  mutate(System =  factor(Var1, levels = unique(taskInfo$System))) %>% arrange(System)
+pie.active <- ggplot(data, aes(x="", y=Freq, fill=System)) +
+  geom_bar(stat="identity", width=1, color="white") +
+  coord_polar("y", start=0) +
+  theme_void()
+#ggsave("Figures/Fig5a_subPie1.svg", pie.active, width = 7.5, height = 5)
+
+### inactive sub-chart
+data <- as.data.frame(table(inactive.df$System)) %>%
+  right_join(as.data.frame(table(taskInfo$System)) %>% select(Var1)) %>% replace(is.na(.), 0) %>%
+  mutate(System =  factor(Var1, levels = unique(taskInfo$System))) %>% arrange(System)
+pie.inactive <- ggplot(data, aes(x="", y=Freq, fill=System)) +
+  geom_bar(stat="identity", width=1, color="white") +
+  coord_polar("y", start=0) +
+  theme_void()
+#ggsave("Figures/Fig5a_subPie2.svg", pie.inactive, width = 7.5, height = 5)
+
+## diff-active sub-chart
+data <- as.data.frame(table(diff_active.df$System)) %>% 
+  right_join(as.data.frame(table(taskInfo$System)) %>% select(Var1)) %>% replace(is.na(.), 0) %>%
+  mutate(System =  factor(Var1, levels = unique(taskInfo$System))) %>% arrange(System)
+pie.diffactive <- ggplot(data, aes(x="", y=Freq, fill=System)) +
+  geom_bar(stat="identity", width=1, color="white") +
+  coord_polar("y", start=0) +
+  theme_void()
+#ggsave("Figures/Fig5a_subPie3.svg", pie.diffactive, width = 7.5, height = 5)
+```
+
+FUNCTION: Proportion of active tasks
+```{r}
+plot.active.tasks <- function(task.matrix, group) {
+  df <- as.data.frame(task.matrix) %>% 
+    tibble::rownames_to_column("task") %>%
+    left_join(taskInfo[, c("task", "System", "Subsystem")])
+  df.system <- data.table(df)[, -c("task", "Subsystem")][, lapply(.SD, sum), by=System]
+  df.plot <- matrix(as.numeric(as.matrix(df.system[, 2:97])), ncol=96) %>%
+    "/"(nrow(task.matrix)) %>% "*"(100) %>% `colnames<-` (colnames(df.system)[2:97]) %>% as.data.frame() %>%
+    mutate(system=df.system$System)
+  df.plot.l <- as.data.frame(df.plot) %>%
+    gather(sample, activity, GNAS:WT, factor_key=T)
+  #subset to only keep samples in group input
+  df.plot.l <- df.plot.l[df.plot.l$sample %in% CHO96$genes[CHO96$amount_microgram %in% group],] %>%
+    left_join(CHO96[, c("genes", "amount_microgram")], by=c("sample"="genes"))
+  #### plot
+  p1 = ggplot(df.plot.l, aes(fill=system, y=activity, x=sample)) +
+    geom_bar(position="stack", stat="identity") + facet_grid(~ amount_microgram, scales="free_x", space="free_x") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    scale_fill_brewer(palette="Set2")
+  
+  #### boxplot percentage of active tasks per group
+  tot.perc.act <- (colSums(task.matrix)/nrow(task.matrix))*100
+  identical(names(tot.perc.act), CHO96$genes)
+  p2.df <- CHO96[, c("genes", "amount_microgram")] %>% dplyr::mutate(percent_activity=tot.perc.act)
+  p2.df <- p2.df[p2.df$amount_microgram %in% group[group != "WT"]]
+  means <- aggregate(percent_activity ~  amount_microgram, p2.df, mean) %>% mutate(percent_activity=round(percent_activity, digits=0))
+  p2=ggplot(p2.df, aes(color=amount_microgram, y=percent_activity, x=amount_microgram)) +
+    geom_boxplot() + stat_summary(fun="mean") +
+    labs(x="cell line group", y = "percent active tasks",  color="amount") +
+    geom_text(data=means, aes(label=percent_activity, y=percent_activity+3), size=4) +
+    theme_classic(base_size=15) +
+    theme(axis.ticks.x = element_blank(), axis.text.x = element_blank())
+  
+table.percent <- as.data.table(df.plot.l[, c("sample", "activity")])[, lapply(.SD, sum), by=sample] %>% 
+    left_join(CHO96[, c("genes", "amount_microgram")], by=c("sample"="genes"))
+  return(list(df.binary = df.plot.l, df=table.percent, barPlot=p1, boxPlot=p2))
+}
+```
+
+Boxplot of %active tasks per group
+```{r}
+viz.activeTasks <- plot.active.tasks(task.matrix = cellFIE.diff.binary, group = c("no amount", "highest amount", "lowest amount", "WT"))
+ggsave("Figures/Fig5a_boxPlot.svg", viz.activeTasks$boxPlot, width = 5, height = 3.5)
+```
+
+
+######################################################
+CORRELATIONS
+######################################################
+
+FUNCTION: correlate task scores with protein yield
+tasks related to AA have ben normalized according to AAC
+```{r}
+AAC <- lapply(CHO96$Construct.seq.aa[1:95], function(x) {protr::extractAAC(x) %>% as.data.frame() %>% t() %>%
+    as.data.frame()}) %>%
+  setNames(CHO96$genes[1:95]) %>% rbindlist(idcol="gene")
+taskInfo.AA <- fread("Data/taskInfo_AAC.csv") %>% left_join(taskInfo)
+identical(colnames(cellFIE), CHO96$Gene_symbol)
+
+cor.task.yield <- function(group, group.col) {
+  idx <- CHO96[[group.col]] %in% group
+  sample.names <- CHO96$genes[idx]
+  cellFIE.subset <- cellFIE[, idx]
+  AAC.subset <- AAC[AAC$gene %in% sample.names ]
+  identical(AAC.subset$gene, colnames(cellFIE.subset))
+
+  ### Correlation of AA subsystem tasks with protein yield accounding for AAC (note: non-proteinogenic subsystems have been excluded)
+  pcor.AA <- list()
+  for (AA in unique(taskInfo.AA$AA_symbol)) {
+    tasks <- taskInfo.AA$task[taskInfo.AA$AA_symbol==AA]
+    AA.tasks <- cellFIE.subset[rownames(cellFIE.subset) %in% tasks ,]
+    AAC.AA <- AAC.subset[[AA]]
+    if (length(AA.tasks)==ncol(cellFIE.subset)) {
+      pcor.res <- ppcor::pcor.test(x=AA.tasks, y=CHO96$Total.purified.protein_stock1.stock2_microg[idx], z=AAC.AA, method="spearman") %>%
+        mutate("task"=tasks) %>% subset(select=c(7,1:6))
+    } else {pcor.res <- apply(AA.tasks, 1, ppcor::pcor.test, y=CHO96$Total.purified.protein_stock1.stock2_microg[idx], z=AAC.AA, method="spearman") %>% 
+      rbindlist(idcol="task")}
+    pcor.AA[[AA]] <- pcor.res
+  }
+  pcor.AA <- do.call("rbind", pcor.AA) %>% mutate(FDR=p.adjust(p.value, method="BH"))
+  
+  ### Correlation of remaining tasks with protein yield
+  identical(colnames(cellFIE.subset), CHO96$genes[idx])
+  cor.yield <- function(task){
+    res.cor <- cor.test(task, CHO96$Total.purified.protein_stock1.stock2_microg[idx], method="spearman")
+    cor.df <- data.table(estimate=res.cor$estimate, p.value=res.cor$p.value)
+    return(cor.df)
+  }
+  cor.tasks <- apply(cellFIE.subset[!rownames(cellFIE.subset) %in% taskInfo.AA$task ,], 1, cor.yield) %>% rbindlist(idcol="task") %>%
+    mutate(FDR=p.adjust(p.value, method="BH"))
+  
+  ### Combine
+  cor.df <- subset(pcor.AA, select=names(cor.tasks)) %>% rbind(cor.tasks) %>% left_join(taskInfo[,-1])
+  return(cor.df)
+}
+```
+
+CORRELATION ANALYSIS AMONG DIFFERNT GROUPS
+```{r}
+# correlation with all samples excluding WT
+cor1.df <- cor.task.yield(group=na.omit(unique(CHO96$PROTEIN.STATE)), group.col = "PROTEIN.STATE")
+# NOTE: no sig correlations
+
+# correlation with all producing samples
+cor2.df <- cor.task.yield(group=unique(CHO96$genes[1:91]), group.col = "genes")
+# NOTE: no sig correlations
+
+# correlation with highest and lowest producers only
+cor3.df <- cor.task.yield(group=c("highest amount", "lowest amount"), group.col = "amount_microgram")
+# NOTE: only grouping that shows significant correlations
+```
+
+```{r}
+View(cor3.df[FDR<= 0.1 & abs(estimate) > 0.5 ,] %>% arrange(desc(abs(estimate))))
+View(cor3.df[FDR<=0.1 ,] %>% arrange(desc(estimate)))
+```
+
+```{r}
+#openxlsx::write.xlsx(cor3.df, "Output/Cellfie_highLow_cor.xlsx")
+```
+
+Treemap of sig correlations (Fig5b)
+```{r}
+treemap.cor3 <- cor3.df[, c("estimate", "FDR", "task", "System", "Subsystem")][, sig := ifelse( FDR <= 0.1,1,NA)][, area := 1][, sig.estimate := estimate*sig]
+
+
+tree <- ggplot(treemap.cor3, aes(area=area, subgroup=System, subgroup2= Subsystem, fill=sig.estimate)) + labs(fill = "correlation") +
+  scale_fill_gradient2() +
+  #scale_fill_manual(values=c("gray72", "lightcoral", "lightgreen"))+
+  geom_treemap(colour="white") +
+  geom_treemap_subgroup2_border(colour="black", size=1) +
+  geom_treemap_subgroup_border(colour="black", size=4) +
+  geom_treemap_subgroup_text(place="centre", grow=F, alpha=0.7, colour="gray99", min.size=0, reflow=T) +
+  geom_treemap_subgroup2_text(place="centre", grow=F, alpha=0.5, colour="black", min.size=0, reflow=T) +
+  theme(legend.title=element_text(size=15), legend.text = element_text(size=13))
+
+saveRDS(tree, "Figures/R_plots/Figure5b.RDS")
+
+#ggsave("Figures/cellfie_treemapCor.svg", tree, width = 6.6, height = 5)
+```
+
+
+
+DIFFERENTIAL ACTIVITY ANALYSIS AMONG DIFFERENT GROUPS
+Welch test: sig task score between different groups
+```{r}
+welch.tasks <- function(cellfie.score, group1, group2, alt) {
+  cellfie.score <- log2(cellfie.score+ 0.00001)
+  group1.score <- cellfie.score[names(cellfie.score) %in% group1]
+  group2.score <- cellfie.score[names(cellfie.score) %in% group2]
+  welch.test <- t.test(group1.score, group2.score, alternative=alt)
+  welch.res <- data.frame(p.value=welch.test$p.value, x.mean=welch.test$estimate[1], y.mean=welch.test$estimate[2])
+  return(welch.res)
+}
+```
+
+producers vs non-producers (excluding WT)
+Also exclude tasks which were inactive in all samples
+```{r}
+welch.task.res1 <- apply(cellFIE[!rowSums(cellFIE.binary)==0 ,], 1, welch.tasks, 
+                        group1=CHO96$genes[1:91],
+                        group2=CHO96$genes[92:95],
+                        alt="two.sided") %>%
+  rbindlist(idcol = "task") %>% dplyr::rename(nonproducers.mean=x.mean) %>% dplyr::rename(producers.mean=y.mean) %>% mutate(LFC=(nonproducers.mean-producers.mean)) %>%
+  mutate(FDR=p.adjust(p.value, method="BH")) %>%
+  left_join(taskInfo) %>%
+  arrange(FDR) 
+
+summary(welch.task.res1$FDR)
+#View(welch.task.res1[FDR <= 0.1 & abs(LFC) >= log2(1.5)])
+```
+
+highest vs lowest amount
+```{r}
+welch.task.res2 <- apply(cellFIE[!rowSums(cellFIE.binary)==0 ,], 1, welch.tasks, 
+                        group1=CHO96[amount_microgram=="highest amount", genes],
+                        group2=CHO96[amount_microgram=="lowest amount", genes],
+                        alt="two.sided") %>%
+  rbindlist(idcol = "task") %>% dplyr::rename(highest.mean=x.mean) %>% dplyr::rename(lowest.mean=y.mean) %>% mutate(LFC=log2(lowest.mean-highest.mean)) %>%
+  mutate(FDR=p.adjust(p.value, method="BH")) %>%
+  left_join(taskInfo) %>%
+  arrange(FDR)
+
+summary(welch.task.res2$FDR)
+#View(welch.task.res2[FDR <= 0.1 & abs(LFC) >= log2(1.5)])
+```
+
+

@@ -1,0 +1,14 @@
+Secretory Subsystem,allProducers,Pass_only
+Post-Golgi trafficking,0.019,0.018
+Golgi glycosylation,0.024,0.024
+COPII,0.014,0.014
+Trafficking regulation,0.066,0.065
+COPI,0.009,0.008
+Protein folding,0.008,0.008
+ERAD,0.027,0.026
+GPI biosynthesis,0.019,0.019
+ER glycosylation,0.007,0.007
+Dolichol pathway,0.009,0.009
+ER calcium homeostasis,0.018,0.015
+UPR,0.046,0.047
+Translocation,0.017,0.017
